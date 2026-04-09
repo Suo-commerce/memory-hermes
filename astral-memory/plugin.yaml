@@ -1,0 +1,19 @@
+# Generation Timestamp: 2026-04-10T03:45:00Z
+name: astral-memory
+version: 1.0.0
+description: >
+  Offline-first persistent memory with surprise-gated learning.
+  No API keys required. Local embeddings, session diary, fleet sync.
+author: Suocommerce
+provides_tools:
+  - astral_recall
+  - astral_store
+  - astral_forget
+  - astral_briefing
+  - astral_diary
+  - astral_stats
+  - astral_sync
+provides_hooks:
+  - pre_llm_call
+  - post_tool_call
+  - on_session_finalize
