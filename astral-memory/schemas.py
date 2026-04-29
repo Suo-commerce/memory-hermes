@@ -1,5 +1,12 @@
-# Generation Timestamp: 2026-04-10T03:45:00Z
-"""Tool schemas — what the LLM reads to decide when to call Astral Core tools."""
+# Generation Timestamp: 2026-04-28T15:55:00Z
+"""
+Tool schemas — what the LLM reads to decide when to call Astral Core tools.
+Version: 2.0.0
+
+These are returned by AstralCoreMemoryProvider.get_tool_schemas() and
+injected into the Hermes tool registry automatically.  The LLM sees
+them alongside built-in tools.
+"""
 
 ASTRAL_RECALL = {
     "name": "astral_recall",

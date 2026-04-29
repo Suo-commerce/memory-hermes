@@ -1,7 +1,7 @@
-# Generation Timestamp: 2026-04-10T04:00:00Z
+# Generation Timestamp: 2026-04-28T16:15:00Z
 ---
 name: astral-memory
-version: 1.0.0
+version: 2.0.0
 description: >
   When and how to use Astral Core persistent memory tools.
   Covers recall, storage, diary, and the "know before speaking" protocol.
@@ -10,7 +10,30 @@ description: >
 # Astral Core Memory — Agent Skill
 
 You have access to persistent long-term memory through Astral Core.
-Memories survive across sessions. Use them.
+Memories survive across sessions.  Use them.
+
+## What Happens Automatically
+
+Before you do anything, know that two things run without your involvement:
+
+- **Auto-recall** — before every turn, the memory provider searches for
+  content relevant to what the user just said and injects it into your
+  context.  You may already have relevant memories visible without calling
+  any tool.
+
+- **Auto-capture** — after every turn, the conversation is sent through
+  the surprise-gated pipeline.  Only genuinely novel information is stored.
+  You do not need to store routine conversation content.
+
+- **Pre-compress save** — when old context is discarded to fit the context
+  window, insights are captured to long-term memory first.  Nothing is
+  silently lost.
+
+- **MEMORY.md mirroring** — anything you write to the built-in MEMORY.md
+  or USER.md is also stored in Astral Core for unified search.
+
+These happen in the background.  Your job is to use the manual tools
+when the automatic behaviour isn't enough.
 
 ## The Rule: Know Before Speaking
 
@@ -18,6 +41,10 @@ Memories survive across sessions. Use them.
 preference — call `astral_recall` FIRST.** Never guess from context
 when you can verify from memory. This is the single most important
 habit for memory-augmented agents.
+
+Even though auto-recall injects some memories, it only fetches a handful
+of the most relevant results.  If you need specific or deep context,
+search explicitly.
 
 Good:
 - User asks "what database do we use?" → `astral_recall("database")` → answer with confidence
@@ -41,6 +68,7 @@ Do NOT use for:
 - General knowledge questions ("what is Kubernetes?")
 - Information the user just provided in this message
 - Simple greetings or small talk
+- Information already visible in the auto-recalled context
 
 ### `astral_store` — Explicit Storage
 Use **only when the user explicitly asks** you to remember something:
@@ -59,9 +87,9 @@ Use at the **start of a session** or when you need a quick overview:
 - "Give me a summary of our work"
 - When you feel disoriented about the user's context
 
-The briefing card is injected automatically at session start, but
-you can request an updated one mid-session if significant memories
-were added.
+The memory provider injects a short system prompt block confirming
+memory is active, but the full briefing card with identity facts,
+active context, and category health requires calling this tool.
 
 ### `astral_diary` — Session Audit Trail
 Use to **record milestones** and **check session history**:
@@ -73,14 +101,18 @@ Write:
 
 Read:
 - "What did we do last session?" → `astral_diary(action="read", limit=5)`
-- Check for previous errors → `astral_diary(action="read", entry_type="error")`
+- Check for previous errors → `astral_diary(action="read")`
+
+A session summary is written automatically when the session ends.
+Use manual diary writes for specific milestones and decisions that
+deserve their own entry.
 
 ### `astral_forget` — Delete Memories
 Use **only when the user explicitly asks** to forget something:
 - "Forget everything from yesterday's import"
 - "Delete the bulk-import memories"
 
-Always confirm before deleting. This is irreversible.
+Always confirm before deleting.  This is irreversible.
 
 ### `astral_stats` — System Health
 Use when the user asks about memory system status:
@@ -102,5 +134,7 @@ Only works when Orbital Fortress is configured.
 3. **Write diary milestones** when something significant is completed
 4. **Check the diary** when the user asks "where did we leave off?"
 5. **One recall per topic** — don't spam 5 recalls in one turn
-6. **Trust the briefing card** for session orientation
-7. **Confirm before forgetting** — deletion is permanent
+6. **Trust the auto-recalled context** for basic orientation
+7. **Use astral_briefing** when you need a fuller picture
+8. **Confirm before forgetting** — deletion is permanent
+9. **Don't duplicate built-in memory writes** — MEMORY.md content is mirrored automatically

@@ -1,6 +1,6 @@
-# Generation Timestamp: 2026-04-10T03:30:00Z
+# Generation Timestamp: 2026-04-29T09:00:00Z
 
-# Astral Core Memory — Hermes Agent Plugin
+# Astral Core Memory — Hermes Agent Memory Provider
 
 Offline-first persistent memory for Hermes Agent. No API keys required.
 
@@ -11,113 +11,129 @@ entirely on your machine.
 
 ---
 
-## What's New in v1.0.0
-
-- **Surprise-gated learning** — only genuinely novel information is stored,
-  not everything the agent sees. Your memory grows with quality, not volume.
-- **Session diary** — structured audit trail of what happened each session.
-  Your agent knows where you left off without replaying full conversations.
-- **Briefing cards** — every session starts with a ≤200 token summary of
-  who you are and what you're working on. The agent knows you from
-  the first message.
-- **Enrichment hints** — the memory system flags ambiguous memories and
-  the agent can ask targeted follow-up questions to improve quality.
-- **Dormant cold storage** — inactive memories move to cold storage to
-  reduce RAM usage. They reactivate automatically when semantically relevant.
-- **Single-file plugin** — drop one Python file into `~/.hermes/plugins/`
-  and memory is active. No build step, no extra dependencies.
-
----
-
 ## Quick Start
 
 ### 1. Install the plugin
 
-```bash
-# Option A: pip (recommended)
-pip install astral-memory-hermes
+Copy the plugin directory into the Hermes source tree. Hermes discovers
+memory providers from `plugins/memory/<name>/` inside the Hermes repo.
 
-# Option B: manual copy
-curl -LO https://raw.githubusercontent.com/Suo-commerce/memory-hermes/main/astral_memory_plugin.py
-cp astral_memory_plugin.py ~/.hermes/plugins/
+```bash
+# Clone this repo
+git clone https://github.com/Suo-commerce/memory-hermes.git
+
+# Copy into Hermes (note: directory MUST be astral_memory with underscore)
+cp -r memory-hermes/astral-memory \
+  ~/Projects/hermes-agent/plugins/memory/astral_memory
 ```
 
-### 2. Download and run the memory server
+> **Why underscore?** Hermes matches `memory.provider` in config against
+> the directory name. Python can't import hyphenated names, and Hermes
+> uses the directory name as the import path. The source repo uses
+> `astral-memory/` (hyphen) but the installed directory must be
+> `astral_memory` (underscore).
 
-The plugin talks to the Astral Core memory server running on your machine.
+### 2. Set the provider
 
 ```bash
-# macOS (Apple Silicon)
+hermes config set memory.provider astral_memory
+```
+
+### 3. Start the memory server
+
+```bash
+# Download (macOS Apple Silicon)
 curl -L https://orbitalfortress.com/download/macos -o astral-memory-server
 chmod +x astral-memory-server
 
-# Linux x86_64
-curl -L https://orbitalfortress.com/download/linux -o astral-memory-server
-chmod +x astral-memory-server
-
-# Windows — download from https://orbitalfortress.com/download/windows
-```
-
-Activate with your license key (one-time):
-
-```bash
+# First run — activate license
 ./astral-memory-server --activate SOUL-XXXX-XXXX-XXXX-XXXX
-```
 
-Start the server:
-
-```bash
+# Start
 ./astral-memory-server
 ```
 
-The server runs on `http://localhost:8090`. Verify:
+Verify it's running:
 
 ```bash
 curl http://localhost:8090/health
 ```
 
-### 3. Start Hermes
+### 4. Start the embedding server
+
+The memory server needs a local embedding model for semantic search:
+
+```bash
+llama-server \
+  --model nomic-embed-text-v1.5.Q5_K_M.gguf \
+  --port 8081 \
+  --embedding \
+  -b 4096 -ub 4096
+```
+
+> **Important:** Always set `-b` and `-ub` to the same value to avoid
+> silent embedding dimension clamping.
+
+### 5. Launch Hermes
 
 ```bash
 hermes
 ```
 
-That's it. The plugin auto-discovers the memory server on startup.
-Your agent now has persistent memory.
+Verify the plugin loaded:
+
+```
+/plugins
+```
+
+You should see `astral-memory v2.0.0` in the list. Test it:
+
+```
+use astral_stats to show memory statistics
+```
+
+---
+
+## What's New in v2.0.0
+
+- **MemoryProvider ABC** — proper Hermes memory provider integration
+  instead of the general plugin API. Shows up in `/plugins`, gets
+  full lifecycle hooks.
+- **Non-blocking sync** — conversation capture runs in daemon threads.
+  Zero latency added to the agent loop.
+- **Pre-compress capture** — when Hermes compresses old context,
+  insights are saved to long-term memory before they're discarded.
+- **MEMORY.md mirroring** — writes to Hermes's built-in MEMORY.md
+  and USER.md are mirrored into Astral Core for unified search.
+- **Circuit breaker** — if the memory server is down, the plugin
+  stops hammering it and recovers gracefully.
 
 ---
 
 ## How It Works
 
-### Briefing Cards
+### Memory Provider Lifecycle
 
-At the start of every session, the plugin fetches a briefing card from
-the memory server. The card is a ≤200 token summary containing:
-
-- **Identity facts** — the user's name, role, preferences
-- **Active context** — current projects, recent decisions, open tasks
-- **Category health** — which knowledge areas are strong or sparse
-
-The agent sees this card before the first turn, so it begins every
-conversation with awareness of who it's talking to. No "remind me what
-we were working on" needed.
-
-The briefing card is generated by the memory engine from stored memories —
-it's not a static profile. As the user's context evolves, so does the card.
+```
+User types message
+  → Hermes calls prefetch(user_message)
+  → Plugin fetches relevant memories from server
+  → Memories injected into the current turn's context
+  → LLM responds (with memory-augmented context)
+  → Hermes calls sync_turn(user_message, assistant_response)
+  → Plugin sends the turn to memory server (background thread)
+  → Memory server runs surprise gate
+  → Only novel information is stored
+```
 
 ### Surprise-Gated Learning
 
 Not everything gets stored. The memory engine uses a Delta Rule matrix
 to predict incoming information against what it already knows. Only
-genuinely novel content passes the surprise gate. This means:
-
-- Repeated information is automatically filtered
-- The memory store grows with quality, not just volume
-- No manual deduplication needed
+genuinely novel content passes the surprise gate. Repeated information
+is automatically filtered.
 
 ### Five-Tier Memory Lifecycle
-
-Memories progress through tiers based on how useful they prove to be:
 
 ```
 Fast (today) → Medium (multi-session) → Slow (long-term)
@@ -127,110 +143,15 @@ Fast (today) → Medium (multi-session) → Slow (long-term)
                                         Archival (signal absorbed)
 ```
 
-The importance scoring system protects high-value memories from
-going dormant. Memories with high access counts, strong utility scores,
-or starred metadata stay active longer.
-
 ### Session Diary
 
-Every session is automatically summarised in a structured diary. When
-you come back tomorrow, the agent doesn't need to replay your full
-conversation history — the diary tells it what happened, what was
-decided, and where you left off.
-
-You can also write diary entries manually through the `astral_diary` tool:
-
-```
-astral_diary("Deployed auth service to staging", "milestone")
-```
-
-Entry types: `note`, `summary`, `error`, `milestone`.
-
-### Enrichment Hints
-
-The Cognitive Shell flags memories where the stored information is
-ambiguous or could benefit from clarification. The agent can surface
-these as natural follow-up questions:
-
-- "You mentioned framework X — did you mean React or the testing library?"
-- "Last time you said the deadline was March — has that changed?"
-
-Enrichment is gentle — the agent asks at most one clarification per
-conversation, woven into the natural flow.
-
-### Fleet Sync (Optional)
-
-With an Orbital Fortress server, memories sync across devices:
-
-```
-Your laptop → Orbital Fortress → Your desktop
-                    ↓
-            Briefings from fleet
-```
-
-Memories are uploaded as derivative representations (not raw text) and
-briefings from other devices are pulled back. Your laptop learns what
-your desktop discovered.
-
-Learn more at [orbitalfortress.com](https://orbitalfortress.com).
-
----
-
-## Setting Up the Embedding Model
-
-The memory server needs a local embedding model to convert text into
-searchable vectors. No external API keys are needed — everything runs
-on your machine.
-
-### Option A — Use the bundled model (recommended)
-
-If you have `llama.cpp` installed, start the embedding server with
-the nomic-embed model:
-
-```bash
-# Download the model (~300MB)
-curl -L https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q5_K_M.gguf \
-  -o nomic-embed-text-v1.5.Q5_K_M.gguf
-
-# Start the embedding server on port 8081
-llama-server \
-  --model nomic-embed-text-v1.5.Q5_K_M.gguf \
-  --port 8081 \
-  --embedding \
-  --ctx-size 2048
-```
-
-The memory server connects to `localhost:8081` by default.
-
-### Option B — Use a different embedding model
-
-Any OpenAI-compatible embedding endpoint works. Pass the URL
-when starting the memory server:
-
-```bash
-./astral-memory-server --embedding-url http://localhost:11434/api/embeddings
-```
-
-This works with Ollama, LM Studio, or any service that serves
-embeddings over HTTP.
-
-### Option C — Use a remote embedding API
-
-If you prefer a hosted embedding service:
-
-```bash
-./astral-memory-server --embedding-url https://api.openai.com/v1/embeddings \
-  --embedding-api-key sk-your-key
-```
-
-This still keeps your memories local — only the embedding vectors
-are generated remotely, not your stored data.
+Every session is automatically summarised via `on_session_end`. The
+agent doesn't need to replay conversation history — the diary tells
+it what happened and where you left off.
 
 ---
 
 ## Agent Tools
-
-The plugin registers these tools with the Hermes agent:
 
 | Tool | What it does |
 |------|-------------|
@@ -242,322 +163,140 @@ The plugin registers these tools with the Hermes agent:
 | `astral_stats` | Full memory system statistics and health |
 | `astral_sync` | Sync with Orbital Fortress (when configured) |
 
-### Auto-recall and auto-capture
+### Automatic Behaviour
 
-In addition to the manual tools, two hooks run automatically:
+In addition to the manual tools, two lifecycle methods run automatically:
 
-- **Auto-recall** (`on_before_prompt`) — searches memory for content
-  relevant to the user's latest message and injects it into the
-  agent's system prompt. The agent sees past context without needing
-  to call `astral_recall` explicitly.
+- **Auto-recall** (`prefetch`) — searches memory for content relevant
+  to the user's latest message and injects it into the agent's context.
 
-- **Auto-capture** (`on_agent_end`) — sends the conversation through
-  the surprise-gated pipeline. Only novel information is stored.
-  The agent doesn't need to call `astral_store` for routine content.
-
-These hooks map to Hermes's plugin lifecycle — `on_before_prompt` fires
-before every LLM call, `on_agent_end` fires after each complete response.
+- **Auto-capture** (`sync_turn`) — sends each conversation turn through
+  the surprise-gated pipeline in a daemon thread. Only novel information
+  is stored. Non-blocking — zero latency added to the agent loop.
 
 ---
 
-## Ingesting Existing Data
+## Configuration
 
-If you have existing notes, documents, or conversation history you
-want the memory server to learn from, use the ingest endpoint.
-
-### Ingest conversation turns
+### Environment variable override
 
 ```bash
-curl -X POST http://localhost:8090/v1/memory/ingest \
-  -H "Content-Type: application/json" \
-  -d '{
-    "turns": [
-      {
-        "user": "We use Kubernetes for deployment with ArgoCD for GitOps",
-        "assistant": "Noted — Kubernetes with ArgoCD for your deployment pipeline."
-      },
-      {
-        "user": "Our database is PostgreSQL 16 with pgvector for embeddings",
-        "assistant": "Got it — PostgreSQL 16 with the pgvector extension."
-      }
-    ],
-    "source": "manual-import"
-  }'
+export ASTRAL_SERVER_URL=http://localhost:9090
 ```
 
-### Ingest documents and files
+### Config file
 
-```bash
-curl -X POST http://localhost:8090/v1/memory/ingest/file \
-  -H "Content-Type: application/json" \
-  -d '{
-    "path": "/home/user/notes/architecture.md",
-    "source": "project-docs"
-  }'
+Config is stored in `~/.hermes/astral-memory.json`:
+
+```json
+{
+  "server_url": "http://localhost:8090",
+  "auto_capture": true,
+  "auto_recall": true,
+  "max_recall_memories": 5,
+  "capture_max_chars": 8000
+}
 ```
 
-### Ingest an entire folder
-
-Point the server at a directory and it will walk all matching files:
-
-```bash
-curl -X POST http://localhost:8090/v1/memory/ingest/folder \
-  -H "Content-Type: application/json" \
-  -d '{
-    "path": "/home/user/project/docs",
-    "extensions": ["md", "txt", "py"],
-    "since_days": 60,
-    "recursive": true
-  }'
-```
-
-### Check what was stored
-
-```bash
-# Total memory count
-curl http://localhost:8090/v1/memory/stats
-
-# Search for specific memories
-curl -X POST http://localhost:8090/v1/memory/search \
-  -H "Content-Type: application/json" \
-  -d '{"query": "deployment", "limit": 5}'
-
-# Get the briefing card
-curl http://localhost:8090/v1/memory/briefing
-```
-
-### Delete imported memories if needed
-
-```bash
-# Delete all memories from a specific source
-curl -X DELETE http://localhost:8090/v1/memory/source/manual-import
-```
-
----
-
-## Re-embedding Memories
-
-If you switch to a different embedding model (different dimensions
-or better quality), your existing memories need to be re-embedded
-to match the new vector space.
-
-### When do I need to re-embed?
-
-- You changed the embedding model (e.g. from nomic 768d to a 1024d model)
-- You upgraded to a newer version of the same model
-- Searches are returning poor results after a model change
-
-### How to re-embed
-
-Stop the memory server, swap the embedding model, and restart
-with the re-embed flag:
-
-```bash
-# 1. Stop the running server (Ctrl+C or kill the process)
-
-# 2. Start the new embedding model on port 8081
-llama-server \
-  --model your-new-embedding-model.gguf \
-  --port 8081 \
-  --embedding \
-  --ctx-size 2048
-
-# 3. Restart the memory server with re-embed flag
-./astral-memory-server --rebuild-embeddings
-```
-
-The server will re-process all existing memories through the new
-embedding model. This may take a few minutes depending on how
-many memories you have. Progress is shown in the terminal.
-
-Your memories (the actual text) are never modified — only the
-vector representations are regenerated.
-
-### Checking embedding status
-
-```bash
-curl http://localhost:8090/health
-```
-
-The response includes embedding dimension and model information
-so you can verify the new model is active.
-
----
-
-## Coming from OpenClaw?
-
-If you were using `@suocommerce/memory-openclaw`, your memories are
-already here. Both plugins share the same memory backend on
-`localhost:8090` — zero migration needed.
-
-Hermes can automatically import your OpenClaw settings:
-
-```bash
-hermes claw migrate
-```
-
-Your memory corpus, briefing cards, and diary entries all carry over.
-The only thing that changes is the plugin bridge — the brain stays the same.
-
----
-
-## Plugin Configuration
-
-The plugin works with zero configuration out of the box. Optional
-settings in `~/.hermes/config.yaml`:
-
-```yaml
-plugins:
-  astral-memory:
-    server_url: "http://localhost:8090"
-    auto_capture: true
-    auto_recall: true
-    max_recall_memories: 5
-    min_similarity: 0.45
-    briefing_card_on_start: true
-    briefing_max_tokens: 200
-    capture_min_messages: 2
-    capture_max_chars: 8000
-    fortress_url: ""
-    health_check_on_start: true
-```
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `server_url` | `http://localhost:8090` | Memory server URL |
-| `auto_capture` | `true` | Store memories after each conversation turn |
-| `auto_recall` | `true` | Inject relevant memories into prompts |
-| `max_recall_memories` | `5` | Max memories injected per prompt |
-| `min_similarity` | `0.45` | Minimum cosine similarity for recall (0.0–1.0) |
-| `briefing_card_on_start` | `true` | Inject briefing card at session start |
-| `briefing_max_tokens` | `200` | Max tokens for the briefing card (50–500) |
-| `capture_min_messages` | `2` | Minimum messages before capturing |
-| `capture_max_chars` | `8000` | Max chars per message sent for capture |
-| `fortress_url` | (empty) | Orbital Fortress URL for cross-device sync |
-| `health_check_on_start` | `true` | Check server health on plugin load |
-
-### Memory Server Configuration
+### Memory server flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--port` | `8090` | Memory server port |
-| `--embedding-url` | `http://localhost:8081` | Embedding server URL |
-| `--embedding-api-key` | (none) | API key for remote embedding services |
-| `--data-dir` | `./data` | Where memories are stored on disk |
-| `--rebuild-embeddings` | (off) | Re-embed all memories on startup |
-| `--activate KEY` | (none) | Activate with license key (first run only) |
+| `--embed-url` | `http://localhost:8081` | Embedding server URL |
+| `--data-path` | `./data/mask` | Where memories are stored |
+| `--activate KEY` | — | Activate with license key |
+| `--no-license` | — | Skip license (debug builds only) |
 
 ---
 
-## Competitive Comparison
+## Repository Structure
 
-| Feature | Hermes built-in | hindsight | ClawMem | **Astral Core** |
-|---------|----------------|-----------|---------|----------------|
-| Works offline | Yes | No (needs API key) | No | **Yes** |
-| Embedding model | None (FTS5 only) | text-embedding-3-small | varies | **nomic-embed (local)** |
-| Write intelligence | Store everything | Store everything | Recency | **Surprise-gated** |
-| Memory lifecycle | None | Time decay | None | **5-tier + dormancy** |
-| Session diary | No | No | No | **Yes** |
-| Briefing cards | No | No | No | **Yes** |
-| Enrichment hints | No | No | No | **Yes** |
-| Cross-device sync | No | No | No | **Yes (Fortress)** |
-| Cost after install | $0 | ~$5-15/mo (OpenAI) | varies | **$0** |
+```
+memory-hermes/
+├── astral-memory/          ← Plugin source (copy as astral_memory/)
+│   ├── __init__.py         ← MemoryProvider implementation
+│   ├── schemas.py          ← Tool schemas for LLM
+│   ├── tools.py            ← Deprecated (v1 compat stub)
+│   └── plugin.yaml         ← Plugin manifest
+├── skills/
+│   └── astral-memory.md    ← Agent skill file
+├── pyproject.toml
+├── README.md
+└── LICENSE
+```
+
+### Install mapping
+
+| Source repo path | Install path in Hermes |
+|---|---|
+| `astral-memory/` | `plugins/memory/astral_memory/` |
+| `skills/astral-memory.md` | `~/.hermes/skills/astral-memory.md` |
 
 ---
 
 ## Troubleshooting
 
+### Plugin shows as `×` in `/plugins`
+
+The config key must match the directory name exactly:
+
+```bash
+# WRONG — hyphen
+hermes config set memory.provider astral-memory
+
+# CORRECT — underscore (matches directory name)
+hermes config set memory.provider astral_memory
+```
+
 ### "Connection refused" on localhost:8090
 
-The memory server isn't running. Start it:
+Start the memory server:
 
 ```bash
 ./astral-memory-server
 ```
 
-### "Embedding server not available"
+### No memories being stored
 
-The embedding model server isn't running on port 8081. Start it:
+Check that the embedding server is running on port 8081. Memories
+can't be stored without embeddings.
 
-```bash
-llama-server --model nomic-embed-text-v1.5.Q5_K_M.gguf --port 8081 --embedding
-```
+### Search returns nothing useful
 
-### Memories aren't being stored
-
-The server filters out information it already knows or considers
-redundant. Check what's stored:
-
-```bash
-curl http://localhost:8090/v1/memory/stats
-```
-
-If the count is zero, verify the embedding server is running —
-memories can't be stored without embeddings.
-
-### Search returns irrelevant results
-
-This usually means the embedding model changed since memories
-were stored. Re-embed:
+If the embedding model changed since memories were stored:
 
 ```bash
 ./astral-memory-server --rebuild-embeddings
 ```
 
-### Plugin not loading in Hermes
+### Circuit breaker triggered
 
-Verify the file is in the right location:
+If the memory server goes down, the plugin stops sending requests
+after 3 consecutive failures and retries after 60 seconds. Restart
+the memory server and it recovers automatically.
 
-```bash
-ls ~/.hermes/plugins/astral_memory_plugin.py
-```
+---
 
-Check Hermes logs for import errors:
+## Coming from OpenClaw?
 
-```bash
-hermes --debug
-```
+Both plugins share the same memory backend on `localhost:8090` — zero
+migration needed. Your memory corpus, briefing cards, and diary entries
+all carry over.
 
-The plugin requires `requests` which is bundled with Hermes. If
-running a minimal install, ensure it's available:
+---
 
-```bash
-pip install requests
-```
+## Competitive Comparison
 
-### Too many dormant reactivations (slow search)
-
-If you have thousands of memories and search feels slow, the
-`min_similarity` threshold may be too low. Raise it in your config:
-
-```yaml
-plugins:
-  astral-memory:
-    min_similarity: 0.5
-```
-
-Values of 0.45–0.55 work well for most use cases.
-
-### Briefing card not appearing
-
-The briefing card requires memory server v2.5.0 or later. Check
-your server version:
-
-```bash
-curl http://localhost:8090/health | python3 -m json.tool | grep version
-```
-
-If the version is older, download the latest binary from
-[orbitalfortress.com](https://orbitalfortress.com).
-
-### Diary entries not persisting
-
-The diary requires memory server v2.6.0 or later (PF-5b endpoints).
-Check the health endpoint for `diary_available: true`:
-
-```bash
-curl http://localhost:8090/health | python3 -m json.tool | grep diary
-```
+| Feature | Hermes built-in | Mem0 | **Astral Core** |
+|---------|----------------|------|----------------|
+| Works offline | Yes | No | **Yes** |
+| Embeddings | FTS5 only | API required | **Local (nomic)** |
+| Write intelligence | Store everything | Store everything | **Surprise-gated** |
+| Memory lifecycle | None | None | **5-tier + dormancy** |
+| Session diary | No | No | **Yes** |
+| Cross-device sync | No | No | **Yes (Fortress)** |
+| Cost after install | $0 | ~$5-15/mo | **$0** |
 
 ---
 
@@ -567,40 +306,24 @@ Astral Core Memory is part of the [Astral Core](https://github.com/Suo-commerce/
 project — a memory engine built for privacy-first, offline-capable
 AI assistants.
 
-The full stack:
+| Component | What it does |
+|-----------|-------------|
+| Memory engine (MASK/HOPE) | Surprise-gated write pipeline |
+| Memory API server | REST endpoints on :8090 |
+| This Hermes plugin | MemoryProvider bridge |
+| [OpenClaw plugin](https://github.com/Suo-commerce/memory-openclaw) | Bridge to OpenClaw |
+| Orbital Fortress | Fleet sync server |
 
-| Component | License | What it does |
-|-----------|---------|-------------|
-| Memory engine (MASK/HOPE) | MIT | Surprise-gated write pipeline |
-| Memory API server | MIT | REST endpoints on :8090 |
-| This Hermes plugin | MIT | Bridge to Hermes Agent |
-| [OpenClaw plugin](https://github.com/Suo-commerce/memory-openclaw) | MIT | Bridge to OpenClaw Gateway |
-| Orbital Fortress | AGPL-3.0 | Fleet sync server (self-hostable) |
-
-Both the Hermes and OpenClaw plugins share the same memory backend.
+Both Hermes and OpenClaw plugins share the same memory backend.
 Switch agents without losing a single memory.
-
----
-
-## Contributing
-
-Issues and PRs welcome at [github.com/Suo-commerce/memory-hermes](https://github.com/Suo-commerce/memory-hermes).
-
-If you're building a memory plugin for another platform (Cursor, Continue,
-VS Code), the Memory API server is platform-agnostic — any HTTP client
-can talk to it.
 
 ---
 
 ## Links
 
-- [Get a license](https://orbitalfortress.com) — €19, one-time, no subscription
-- [How Astral Core works](https://orbitalfortress.com/how-it-works) — for non-technical users
-- [For Developers](https://orbitalfortress.com/developers) — API reference and integration guide
-- [OpenClaw Plugin](https://github.com/Suo-commerce/memory-openclaw) — same brain, different agent
+- [Get a license](https://orbitalfortress.com) — €19, one-time
+- [OpenClaw Plugin](https://github.com/Suo-commerce/memory-openclaw)
 - [Report an issue](https://github.com/Suo-commerce/memory-hermes/issues)
-
----
 
 ## License
 

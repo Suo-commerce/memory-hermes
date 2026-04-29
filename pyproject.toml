@@ -1,33 +1,46 @@
-# Generation Timestamp: 2026-04-10T04:00:00Z
+# Generation Timestamp: 2026-04-29T09:15:00Z
+#
+# Astral Core Memory — Hermes Agent Memory Provider
+#
+# INSTALL NOTE:
+#   pip install is NOT the primary install method. Hermes discovers
+#   memory providers from plugins/memory/<name>/ inside the Hermes
+#   repo (or $HERMES_HOME/plugins/<name>/ for user-installed).
+#
+#   Primary install:
+#     cp -r astral-memory ~/Projects/hermes-agent/plugins/memory/astral_memory
+#
+#   The pip entry point below is for future Hermes versions that may
+#   support pip-installed memory providers.
+
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "astral-memory-hermes"
-version = "1.0.0"
-description = "Offline-first persistent memory plugin for Hermes Agent. Surprise-gated learning, local embeddings, fleet sync. No API keys required."
+version = "2.0.0"
+description = "Offline-first persistent memory provider for Hermes Agent. Surprise-gated learning, local embeddings, session diary, fleet sync. No API keys required."
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 authors = [
     {name = "Suocommerce", email = "support@suocommerce.fi"},
 ]
 keywords = [
-    "hermes-agent", "memory", "ai-memory", "offline",
+    "hermes-agent", "memory", "memory-provider", "ai-memory", "offline",
     "local-embeddings", "persistent-memory", "surprise-gating",
-    "astral-core", "llm-memory",
+    "astral-core", "llm-memory", "fleet-sync",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
@@ -43,11 +56,17 @@ Issues = "https://github.com/Suo-commerce/memory-hermes/issues"
 "Memory Server" = "https://orbitalfortress.com"
 "OpenClaw Plugin" = "https://github.com/Suo-commerce/memory-openclaw"
 
-[project.entry-points."hermes_agent.plugins"]
-astral-memory = "astral_memory"
+# pip entry point — aspirational, Hermes does not yet discover via pip
+# When Hermes adds pip-based provider discovery, this will work automatically
+[project.entry-points."hermes_agent.memory_providers"]
+astral_memory = "astral_memory"
 
 [tool.setuptools.packages.find]
 include = ["astral_memory*"]
+
+# Map on-disk directory (astral-memory/) to Python package (astral_memory)
+[tool.setuptools.package-dir]
+astral_memory = "astral-memory"
 
 [tool.setuptools.package-data]
 astral_memory = ["plugin.yaml"]
