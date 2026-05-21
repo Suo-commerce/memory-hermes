@@ -1,4 +1,4 @@
-# Generation Timestamp: 2026-04-29T09:10:00Z
+# Generation Timestamp: 2026-05-21T10:20:00Z
 # Astral Core Memory — Hermes Memory Provider Plugin Manifest
 #
 # Source:   astral-memory/plugin.yaml (this repo)
@@ -11,10 +11,11 @@
 # directory name, not this manifest's name field.
 
 name: astral-memory
-version: 2.0.0
+version: 2.1.0
 description: >
   Offline-first persistent memory with surprise-gated learning, local
-  embeddings, session diary, and fleet sync.  No API keys required.
+  embeddings, cross-encoder reranking, HyDE query expansion, session
+  diary, and fleet sync.  No API keys required.
   The only Hermes memory provider that works completely offline.
 author: Suocommerce
 homepage: https://github.com/Suo-commerce/memory-hermes

@@ -1,4 +1,4 @@
-# Generation Timestamp: 2026-04-29T09:00:00Z
+# Generation Timestamp: 2026-05-21T10:00:00Z
 
 # Astral Core Memory — Hermes Agent Memory Provider
 
@@ -39,27 +39,11 @@ cp -r memory-hermes/astral-memory \
 hermes config set memory.provider astral_memory
 ```
 
-### 3. Start the memory server
+### 3. Start the three services
 
-```bash
-# Download (macOS Apple Silicon)
-curl -L https://orbitalfortress.com/download/macos -o astral-memory-server
-chmod +x astral-memory-server
+Astral Core runs three local services. Start them in order:
 
-# First run — activate license
-./astral-memory-server --activate SOUL-XXXX-XXXX-XXXX-XXXX
-
-# Start
-./astral-memory-server
-```
-
-Verify it's running:
-
-```bash
-curl http://localhost:8090/health
-```
-
-### 4. Start the embedding server
+#### 3a. Embedding server
 
 The memory server needs a local embedding model for semantic search:
 
@@ -74,7 +58,55 @@ llama-server \
 > **Important:** Always set `-b` and `-ub` to the same value to avoid
 > silent embedding dimension clamping.
 
-### 5. Launch Hermes
+#### 3b. Reranker sidecar (recommended)
+
+The reranker dramatically improves retrieval quality by re-scoring
+candidate memories with a cross-encoder model. It auto-downloads the
+model (~90MB) on first run.
+
+```bash
+pip install sentence-transformers flask
+python3 rerank_server.py --port 8082
+```
+
+The reranker uses `cross-encoder/ms-marco-MiniLM-L-6-v2` (22M params,
+CPU-only, ~5ms per query). This is the same model that achieves 90.3%
+session recall on the LoCoMo benchmark.
+
+> **Optional but recommended.** Without the reranker, retrieval still
+> works via cosine similarity — you just get less accurate ranking.
+
+#### 3c. Memory server
+
+```bash
+# Download (macOS Apple Silicon)
+curl -L https://orbitalfortress.com/download/macos -o astral-memory-server
+chmod +x astral-memory-server
+
+# First run — activate license
+./astral-memory-server --activate SOUL-XXXX-XXXX-XXXX-XXXX
+
+# Start with full pipeline (reranker + HyDE query expansion)
+./astral-memory-server \
+  --embed-url http://localhost:8081 \
+  --deep-rerank \
+  --deep-rerank-url http://localhost:8082 \
+  --hyde
+```
+
+If you skipped the reranker sidecar, omit the `--deep-rerank` flags:
+
+```bash
+./astral-memory-server --embed-url http://localhost:8081
+```
+
+Verify it's running:
+
+```bash
+curl http://localhost:8090/health
+```
+
+### 4. Launch Hermes
 
 ```bash
 hermes
@@ -86,13 +118,26 @@ Verify the plugin loaded:
 /plugins
 ```
 
-You should see `astral-memory v2.0.0` in the list. Test it:
+You should see `astral-memory v2.1.0` in the list. Test it:
 
 ```
 use astral_stats to show memory statistics
 ```
 
 ---
+
+## What's New in v2.1.0
+
+- **Cross-encoder reranking** — bundled `rerank_server.py` sidecar
+  using MiniLM (22M params, CPU-only). Dramatically improves retrieval
+  accuracy by re-scoring candidate memories with a cross-encoder.
+  Auto-downloads model on first run.
+- **HyDE query expansion** — the memory server rewrites queries into
+  hypothetical answers before embedding, improving recall on complex
+  questions. Enabled via `--hyde` flag.
+- **Server-side intelligence** — all retrieval intelligence (reranking,
+  query expansion, session expansion, deduplication) now runs inside
+  the memory server. The plugin remains a thin bridge.
 
 ## What's New in v2.0.0
 
@@ -118,6 +163,7 @@ use astral_stats to show memory statistics
 User types message
   → Hermes calls prefetch(user_message)
   → Plugin fetches relevant memories from server
+  → Server runs: HyDE → embedding search → cross-encoder rerank → expand
   → Memories injected into the current turn's context
   → LLM responds (with memory-augmented context)
   → Hermes calls sync_turn(user_message, assistant_response)
@@ -204,9 +250,20 @@ Config is stored in `~/.hermes/astral-memory.json`:
 |------|---------|-------------|
 | `--port` | `8090` | Memory server port |
 | `--embed-url` | `http://localhost:8081` | Embedding server URL |
+| `--deep-rerank` | off | Enable cross-encoder reranking |
+| `--deep-rerank-url` | `http://localhost:8082` | Reranker sidecar URL |
+| `--hyde` | off | Enable HyDE query expansion |
 | `--data-path` | `./data/mask` | Where memories are stored |
 | `--activate KEY` | — | Activate with license key |
 | `--no-license` | — | Skip license (debug builds only) |
+
+### Reranker sidecar flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--port` | `8082` | Reranker port |
+| `--model` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Cross-encoder model |
+| `--host` | `0.0.0.0` | Bind address |
 
 ---
 
@@ -219,6 +276,7 @@ memory-hermes/
 │   ├── schemas.py          ← Tool schemas for LLM
 │   ├── tools.py            ← Deprecated (v1 compat stub)
 │   └── plugin.yaml         ← Plugin manifest
+├── rerank_server.py        ← MiniLM reranker sidecar (new in v2.1.0)
 ├── skills/
 │   └── astral-memory.md    ← Agent skill file
 ├── pyproject.toml
@@ -232,6 +290,7 @@ memory-hermes/
 |---|---|
 | `astral-memory/` | `plugins/memory/astral_memory/` |
 | `skills/astral-memory.md` | `~/.hermes/skills/astral-memory.md` |
+| `rerank_server.py` | anywhere on PATH (runs standalone) |
 
 ---
 
@@ -254,8 +313,20 @@ hermes config set memory.provider astral_memory
 Start the memory server:
 
 ```bash
-./astral-memory-server
+./astral-memory-server --embed-url http://localhost:8081 \
+  --deep-rerank --deep-rerank-url http://localhost:8082 --hyde
 ```
+
+### "Connection refused" on localhost:8082
+
+Start the reranker sidecar:
+
+```bash
+python3 rerank_server.py --port 8082
+```
+
+The memory server will work without the reranker — it falls back to
+cosine-only ranking. But retrieval quality will be noticeably lower.
 
 ### No memories being stored
 
@@ -276,6 +347,16 @@ If the memory server goes down, the plugin stops sending requests
 after 3 consecutive failures and retries after 60 seconds. Restart
 the memory server and it recovers automatically.
 
+### Reranker model download slow
+
+The first run of `rerank_server.py` downloads the MiniLM model (~90MB)
+from Hugging Face. On slow connections, set `HF_HUB_DOWNLOAD_TIMEOUT`
+to increase the timeout, or pre-download:
+
+```bash
+python3 -c "from sentence_transformers import CrossEncoder; CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')"
+```
+
 ---
 
 ## Coming from OpenClaw?
@@ -292,6 +373,7 @@ all carry over.
 |---------|----------------|------|----------------|
 | Works offline | Yes | No | **Yes** |
 | Embeddings | FTS5 only | API required | **Local (nomic)** |
+| Cross-encoder reranking | No | No | **Yes (MiniLM)** |
 | Write intelligence | Store everything | Store everything | **Surprise-gated** |
 | Memory lifecycle | None | None | **5-tier + dormancy** |
 | Session diary | No | No | **Yes** |
@@ -306,13 +388,14 @@ Astral Core Memory is part of the [Astral Core](https://github.com/Suo-commerce/
 project — a memory engine built for privacy-first, offline-capable
 AI assistants.
 
-| Component | What it does |
-|-----------|-------------|
-| Memory engine (MASK/HOPE) | Surprise-gated write pipeline |
-| Memory API server | REST endpoints on :8090 |
-| This Hermes plugin | MemoryProvider bridge |
-| [OpenClaw plugin](https://github.com/Suo-commerce/memory-openclaw) | Bridge to OpenClaw |
-| Orbital Fortress | Fleet sync server |
+| Component | Port | What it does |
+|-----------|------|-------------|
+| Embedding server | 8081 | nomic-embed-text via llama-server |
+| Reranker sidecar | 8082 | MiniLM cross-encoder via sentence-transformers |
+| Memory server | 8090 | MASK/HOPE pipeline, REST API |
+| This Hermes plugin | — | MemoryProvider bridge |
+| [OpenClaw plugin](https://github.com/Suo-commerce/memory-openclaw) | — | Bridge to OpenClaw |
+| Orbital Fortress | remote | Fleet sync server |
 
 Both Hermes and OpenClaw plugins share the same memory backend.
 Switch agents without losing a single memory.

@@ -1,7 +1,7 @@
-# Generation Timestamp: 2026-04-28T15:10:00Z
+# Generation Timestamp: 2026-05-21T10:15:00Z
 """
 Astral Core Memory — Hermes Agent Memory Provider Plugin
-Version: 2.0.0
+Version: 2.1.0
 
 Offline-first persistent memory with surprise-gated learning.
 Implements the MemoryProvider ABC for proper Hermes integration.
@@ -13,8 +13,12 @@ Install:
 Architecture:
   Thin HTTP bridge → Astral Core memory server (:8090).
   The server runs the full MASK/HOPE pipeline — surprise gating,
-  Delta Rule matrix, 5-tier lifecycle, hybrid retrieval, Dreamer
-  consolidation.  This plugin just talks to it.
+  Delta Rule matrix, 5-tier lifecycle, hybrid retrieval (HyDE +
+  cross-encoder reranking + session expansion), Dreamer consolidation.
+  This plugin just talks to it.
+
+v2.1.0: Server-side cross-encoder reranking (MiniLM sidecar on :8082)
+  and HyDE query expansion. All retrieval intelligence is server-side.
 
 Repository: https://github.com/Suo-commerce/memory-hermes
 License: MIT
@@ -40,7 +44,7 @@ logger = logging.getLogger("astral-memory")
 # Constants
 # ---------------------------------------------------------------------------
 
-_VERSION = "2.0.0"
+_VERSION = "2.1.0"
 _DEFAULT_SERVER_URL = "http://localhost:8090"
 _CONNECT_TIMEOUT = 3.0
 _REQUEST_TIMEOUT = 10.0
@@ -273,17 +277,27 @@ class AstralCoreMemoryProvider(MemoryProvider):
         health = self._http.health()
         if health:
             self._server_healthy = True
+            rerank_status = "on" if health.get("deep_rerank_enabled") else "off"
+            hyde_status = "on" if health.get("hyde_enabled") else "off"
             logger.info(
-                "Astral Core Memory: %s v%s — %d memories, embedding=%s",
+                "Astral Core Memory: %s v%s — %d memories, "
+                "embedding=%s, rerank=%s, hyde=%s",
                 health.get("status", "?"),
                 health.get("version", "?"),
                 health.get("total_memories", 0),
                 health.get("embedding_backend", "?"),
+                rerank_status,
+                hyde_status,
             )
         else:
             logger.warning(
                 "Astral Core memory server not reachable at %s. "
-                "Start it with: python memory_api_server.py --port 8090",
+                "Start the three services:\n"
+                "  1. llama-server --model nomic-embed-text-v1.5.Q5_K_M.gguf "
+                "--port 8081 --embedding -b 4096 -ub 4096\n"
+                "  2. python3 rerank_server.py --port 8082\n"
+                "  3. ./astral-memory-server --embed-url http://localhost:8081 "
+                "--deep-rerank --deep-rerank-url http://localhost:8082 --hyde",
                 self._server_url,
             )
 

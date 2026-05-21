@@ -1,4 +1,4 @@
-# Generation Timestamp: 2026-04-29T09:15:00Z
+# Generation Timestamp: 2026-05-21T10:20:00Z
 #
 # Astral Core Memory — Hermes Agent Memory Provider
 #
@@ -19,8 +19,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "astral-memory-hermes"
-version = "2.0.0"
-description = "Offline-first persistent memory provider for Hermes Agent. Surprise-gated learning, local embeddings, session diary, fleet sync. No API keys required."
+version = "2.1.0"
+description = "Offline-first persistent memory provider for Hermes Agent. Surprise-gated learning, local embeddings, cross-encoder reranking, HyDE query expansion, session diary, fleet sync. No API keys required."
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
@@ -30,7 +30,8 @@ authors = [
 keywords = [
     "hermes-agent", "memory", "memory-provider", "ai-memory", "offline",
     "local-embeddings", "persistent-memory", "surprise-gating",
-    "astral-core", "llm-memory", "fleet-sync",
+    "astral-core", "llm-memory", "fleet-sync", "cross-encoder",
+    "reranking",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -48,6 +49,14 @@ dependencies = [
     "requests>=2.25.0",
 ]
 
+[project.optional-dependencies]
+# Install with: pip install astral-memory-hermes[reranker]
+# Provides rerank_server.py — the MiniLM cross-encoder sidecar
+reranker = [
+    "sentence-transformers>=2.2.0",
+    "flask>=2.3.0",
+]
+
 [project.urls]
 Homepage = "https://github.com/Suo-commerce/memory-hermes"
 Documentation = "https://github.com/Suo-commerce/memory-hermes#readme"
@@ -61,6 +70,10 @@ Issues = "https://github.com/Suo-commerce/memory-hermes/issues"
 [project.entry-points."hermes_agent.memory_providers"]
 astral_memory = "astral_memory"
 
+# rerank_server.py as a console script for convenience
+[project.scripts]
+astral-rerank-server = "rerank_server:main"
+
 [tool.setuptools.packages.find]
 include = ["astral_memory*"]
 
@@ -70,3 +83,7 @@ astral_memory = "astral-memory"
 
 [tool.setuptools.package-data]
 astral_memory = ["plugin.yaml"]
+
+# Include rerank_server.py at the package root
+[tool.setuptools.py-modules]
+rerank_server = "rerank_server"
