@@ -1,4 +1,26 @@
-# Generation Timestamp: 2026-05-21T10:00:00Z
+<!-- Generation Timestamp: 2026-07-09T00:00:00Z -->
+<!--
+  v2.2.0 CHANGES:
+    NEW  — Compatibility matrix. The absence of one is why the v2.1.0 outage
+           was invisible: nothing told a user their plugin and their Hermes
+           disagreed.
+    NEW  — Upgrade notice for the silent-memory-failure bug.
+    NEW  — Troubleshooting entry for "memory stopped working after update",
+           listed first because it is the current top support issue.
+    FIX  — `/plugins` output now reads v2.2.0.
+    FIX  — Config block documents every key the code actually reads
+           (briefing_on_start, min_similarity, data_dir were undocumented).
+    FIX  — Lifecycle section documents session_id-scoped calls and the hooks
+           added in v2.2.0 (on_session_switch, on_delegation, backup_paths).
+    FIX  — "daemon threads" -> bounded worker pool.
+    FIX  — Repository structure reflects tests/ and .github/; tools.py removed.
+
+  UNRESOLVED — see the note at the bottom of this file before publishing.
+    `rerank_server.py` is referenced in Quick Start, Repository Structure,
+    Install Mapping, and Troubleshooting, but does not exist in this repo.
+    Either vendor it or strip those four sections. Do not ship this README
+    until that is settled.
+-->
 
 # Astral Core Memory — Hermes Agent Memory Provider
 
@@ -11,6 +33,43 @@ entirely on your machine.
 
 ---
 
+## Compatibility
+
+Hermes changed the `MemoryProvider` interface in v0.18.0. Plugin versions are
+not interchangeable across that boundary.
+
+| Hermes Agent | Plugin version | Status |
+|---|---|---|
+| `>= v2026.7.1` (v0.18.0) | **2.2.0** | Supported |
+| `v0.17.x` and earlier | 2.1.0 | End of life — no further fixes |
+| Any | 2.1.0 on Hermes ≥ v0.18.0 | **Broken. Memory silently does nothing.** |
+
+Check your versions:
+
+```bash
+hermes --version
+hermes plugins   # look for: astral-memory v2.2.0
+```
+
+### If you are on plugin 2.1.0 with Hermes v0.18.0 or newer
+
+Your memory has not been recording, and nothing has been recalled into
+context, since you updated Hermes. The agent kept working, so there was
+nothing to see.
+
+Hermes v0.18.0 began passing a `session_id` keyword to `prefetch()`,
+`queue_prefetch()` and `sync_turn()`. Plugin 2.1.0 did not accept it, so every
+call raised `TypeError`. Hermes catches provider exceptions so that a failing
+memory backend can never break your turn — at `DEBUG` level for recall, and
+`WARNING` for capture. The result was a total memory outage with no traceback
+and no error message.
+
+Upgrade the plugin (below). Memories stored before the Hermes update are
+intact and will be recalled again immediately. Conversations that happened
+during the outage were never captured and cannot be recovered.
+
+---
+
 ## Quick Start
 
 ### 1. Install the plugin
@@ -19,19 +78,26 @@ Copy the plugin directory into the Hermes source tree. Hermes discovers
 memory providers from `plugins/memory/<name>/` inside the Hermes repo.
 
 ```bash
-# Clone this repo
 git clone https://github.com/Suo-commerce/memory-hermes.git
 
-# Copy into Hermes (note: directory MUST be astral_memory with underscore)
+# Note: the installed directory MUST be astral_memory (underscore)
 cp -r memory-hermes/astral-memory \
   ~/Projects/hermes-agent/plugins/memory/astral_memory
 ```
 
-> **Why underscore?** Hermes matches `memory.provider` in config against
-> the directory name. Python can't import hyphenated names, and Hermes
-> uses the directory name as the import path. The source repo uses
-> `astral-memory/` (hyphen) but the installed directory must be
-> `astral_memory` (underscore).
+> **Why underscore?** Hermes matches `memory.provider` in config against the
+> directory name, and uses that name as the Python import path. Python cannot
+> import hyphenated names. The source repo uses `astral-memory/` (hyphen);
+> the installed directory must be `astral_memory` (underscore).
+
+Upgrading? Remove the old directory first, so a stale `tools.py` or `.pyc`
+cannot shadow the new module:
+
+```bash
+rm -rf ~/Projects/hermes-agent/plugins/memory/astral_memory
+cp -r memory-hermes/astral-memory \
+  ~/Projects/hermes-agent/plugins/memory/astral_memory
+```
 
 ### 2. Set the provider
 
@@ -39,13 +105,9 @@ cp -r memory-hermes/astral-memory \
 hermes config set memory.provider astral_memory
 ```
 
-### 3. Start the three services
-
-Astral Core runs three local services. Start them in order:
+### 3. Start the local services
 
 #### 3a. Embedding server
-
-The memory server needs a local embedding model for semantic search:
 
 ```bash
 llama-server \
@@ -55,38 +117,34 @@ llama-server \
   -b 4096 -ub 4096
 ```
 
-> **Important:** Always set `-b` and `-ub` to the same value to avoid
-> silent embedding dimension clamping.
+> **Important:** always set `-b` and `-ub` to the same value. Mismatched
+> values cause silent batch clamping, and embeddings degrade without error.
 
-#### 3b. Reranker sidecar (recommended)
+#### 3b. Reranker sidecar (optional, recommended)
 
-The reranker dramatically improves retrieval quality by re-scoring
-candidate memories with a cross-encoder model. It auto-downloads the
-model (~90MB) on first run.
+The reranker re-scores candidate memories with a cross-encoder. It uses
+`cross-encoder/ms-marco-MiniLM-L-6-v2` (22M params, CPU-only, ~5ms per query)
+and auto-downloads the model (~90MB) on first run.
 
 ```bash
 pip install sentence-transformers flask
 python3 rerank_server.py --port 8082
 ```
 
-The reranker uses `cross-encoder/ms-marco-MiniLM-L-6-v2` (22M params,
-CPU-only, ~5ms per query). This is the same model that achieves 90.3%
-session recall on the LoCoMo benchmark.
-
-> **Optional but recommended.** Without the reranker, retrieval still
-> works via cosine similarity — you just get less accurate ranking.
+Without it, retrieval still works via cosine similarity — ranking is simply
+less accurate.
 
 #### 3c. Memory server
 
 ```bash
-# Download (macOS Apple Silicon)
+# macOS Apple Silicon
 curl -L https://orbitalfortress.com/download/macos -o astral-memory-server
 chmod +x astral-memory-server
 
-# First run — activate license
+# First run — activate
 ./astral-memory-server --activate SOUL-XXXX-XXXX-XXXX-XXXX
 
-# Start with full pipeline (reranker + HyDE query expansion)
+# Start with the full pipeline
 ./astral-memory-server \
   --embed-url http://localhost:8081 \
   --deep-rerank \
@@ -94,13 +152,13 @@ chmod +x astral-memory-server
   --hyde
 ```
 
-If you skipped the reranker sidecar, omit the `--deep-rerank` flags:
+Without the reranker sidecar, omit the `--deep-rerank` flags:
 
 ```bash
 ./astral-memory-server --embed-url http://localhost:8081
 ```
 
-Verify it's running:
+Verify:
 
 ```bash
 curl http://localhost:8090/health
@@ -112,72 +170,92 @@ curl http://localhost:8090/health
 hermes
 ```
 
-Verify the plugin loaded:
+Then, inside the agent:
 
 ```
 /plugins
 ```
 
-You should see `astral-memory v2.1.0` in the list. Test it:
+You should see `astral-memory v2.2.0`. Confirm it can reach the server:
 
 ```
 use astral_stats to show memory statistics
 ```
 
+If `astral_stats` returns memory counts, the bridge is live. If it returns an
+error, the plugin loaded but the memory server is unreachable — see
+Troubleshooting.
+
 ---
 
-## What's New in v2.1.0
+## What's New
 
-- **Cross-encoder reranking** — bundled `rerank_server.py` sidecar
-  using MiniLM (22M params, CPU-only). Dramatically improves retrieval
-  accuracy by re-scoring candidate memories with a cross-encoder.
-  Auto-downloads model on first run.
-- **HyDE query expansion** — the memory server rewrites queries into
-  hypothetical answers before embedding, improving recall on complex
-  questions. Enabled via `--hyde` flag.
-- **Server-side intelligence** — all retrieval intelligence (reranking,
-  query expansion, session expansion, deduplication) now runs inside
-  the memory server. The plugin remains a thin bridge.
+### v2.2.0 — contract repair
 
-## What's New in v2.0.0
+- **Fixes the silent memory outage on Hermes ≥ v0.18.0.** `prefetch()`,
+  `queue_prefetch()` and `sync_turn()` now accept the `session_id` keyword
+  Hermes passes on every call.
+- **Correct session scoping.** The active session id is now updated on
+  `/new`, `/reset`, `/branch`, `/resume` and context compression. Previously
+  it was captured once at startup, so every memory written after a session
+  switch carried a stale source tag.
+- **Per-session recall isolation.** The prefetch cache is keyed by session id.
+  Concurrent gateway sessions can no longer read one another's context.
+- **Subagent results are captured.** Hermes runs subagents with
+  `skip_memory=True`, so the parent provider is the only place a delegation
+  result can land. They were previously discarded.
+- **`hermes backup` now captures the corpus** via `backup_paths()`.
+- **Compression contributions.** `on_pre_compress()` tells the compressor that
+  the span has been persisted, so it can preserve decisions rather than prose.
+- **A contract guard runs at startup.** If a future Hermes release changes the
+  interface, you get a loud `ERROR` in the log instead of silence.
 
-- **MemoryProvider ABC** — proper Hermes memory provider integration
-  instead of the general plugin API. Shows up in `/plugins`, gets
-  full lifecycle hooks.
-- **Non-blocking sync** — conversation capture runs in daemon threads.
-  Zero latency added to the agent loop.
-- **Pre-compress capture** — when Hermes compresses old context,
-  insights are saved to long-term memory before they're discarded.
-- **MEMORY.md mirroring** — writes to Hermes's built-in MEMORY.md
-  and USER.md are mirrored into Astral Core for unified search.
-- **Circuit breaker** — if the memory server is down, the plugin
-  stops hammering it and recovers gracefully.
+### v2.1.0
+
+- Cross-encoder reranking via the MiniLM sidecar.
+- HyDE query expansion (`--hyde`).
+- All retrieval intelligence moved server-side; the plugin stays a thin bridge.
+
+### v2.0.0
+
+- `MemoryProvider` ABC integration — appears in `/plugins`, full lifecycle hooks.
+- Non-blocking capture.
+- Pre-compress capture.
+- `MEMORY.md` / `USER.md` mirroring.
+- Circuit breaker on a dead server.
 
 ---
 
 ## How It Works
 
-### Memory Provider Lifecycle
+### Lifecycle
 
 ```
 User types message
-  → Hermes calls prefetch(user_message)
-  → Plugin fetches relevant memories from server
+  → Hermes calls prefetch(message, session_id=...)
+  → Plugin returns cached context, or fetches it synchronously
   → Server runs: HyDE → embedding search → cross-encoder rerank → expand
-  → Memories injected into the current turn's context
-  → LLM responds (with memory-augmented context)
-  → Hermes calls sync_turn(user_message, assistant_response)
-  → Plugin sends the turn to memory server (background thread)
-  → Memory server runs surprise gate
-  → Only novel information is stored
+  → Memories injected into this turn's context
+  → LLM responds
+
+  → Hermes calls sync_turn(user, assistant, session_id=..., messages=[...])
+  → Plugin queues the turn on a bounded worker pool
+  → Server runs the surprise gate; only novel information is stored
+
+  → Hermes calls queue_prefetch(message, session_id=...)
+  → Plugin warms the cache for the next turn
 ```
+
+Session boundaries (`on_session_switch`), subagent returns (`on_delegation`),
+context compression (`on_pre_compress`) and session end (`on_session_end`) are
+all handled. Background work runs on a bounded pool — a slow or wedged memory
+server cannot stall the agent loop, and a dead one cannot break a turn.
 
 ### Surprise-Gated Learning
 
-Not everything gets stored. The memory engine uses a Delta Rule matrix
-to predict incoming information against what it already knows. Only
-genuinely novel content passes the surprise gate. Repeated information
-is automatically filtered.
+Not everything is stored. The engine uses a Delta Rule matrix to predict
+incoming information against what it already knows. Only genuinely novel
+content passes the gate; repetition is filtered out.
 
 ### Five-Tier Memory Lifecycle
 
@@ -191,9 +269,8 @@ Fast (today) → Medium (multi-session) → Slow (long-term)
 
 ### Session Diary
 
-Every session is automatically summarised via `on_session_end`. The
-agent doesn't need to replay conversation history — the diary tells
-it what happened and where you left off.
+Each session is summarised on exit. The agent does not replay history — the
+diary tells it what happened and where you left off.
 
 ---
 
@@ -206,43 +283,51 @@ it what happened and where you left off.
 | `astral_forget` | Delete all memories from a specific source |
 | `astral_briefing` | Get a briefing card summary on demand |
 | `astral_diary` | Write or read session diary entries |
-| `astral_stats` | Full memory system statistics and health |
+| `astral_stats` | Memory system statistics and health |
 | `astral_sync` | Sync with Orbital Fortress (when configured) |
 
-### Automatic Behaviour
-
-In addition to the manual tools, two lifecycle methods run automatically:
-
-- **Auto-recall** (`prefetch`) — searches memory for content relevant
-  to the user's latest message and injects it into the agent's context.
-
-- **Auto-capture** (`sync_turn`) — sends each conversation turn through
-  the surprise-gated pipeline in a daemon thread. Only novel information
-  is stored. Non-blocking — zero latency added to the agent loop.
+Auto-recall and auto-capture run without the agent invoking anything. The
+tools are for when it needs to reach for memory deliberately.
 
 ---
 
 ## Configuration
 
-### Environment variable override
+### Environment overrides
 
 ```bash
 export ASTRAL_SERVER_URL=http://localhost:9090
+export ASTRAL_DATA_DIR=~/.astral        # used by `hermes backup`
 ```
 
 ### Config file
 
-Config is stored in `~/.hermes/astral-memory.json`:
+`~/.hermes/astral-memory.json` — or run `hermes memory setup` and answer the
+prompts.
 
 ```json
 {
   "server_url": "http://localhost:8090",
+  "data_dir": "~/.astral",
   "auto_capture": true,
   "auto_recall": true,
   "max_recall_memories": 5,
-  "capture_max_chars": 8000
+  "capture_max_chars": 8000,
+  "briefing_on_start": false,
+  "min_similarity": null
 }
 ```
+
+| Key | Default | Description |
+|---|---|---|
+| `server_url` | `http://localhost:8090` | Memory server address |
+| `data_dir` | `~/.astral` | Corpus location; declared to `hermes backup` |
+| `auto_capture` | `true` | Send each turn through the surprise gate |
+| `auto_recall` | `true` | Inject relevant memories before each turn |
+| `max_recall_memories` | `5` | Memories injected per turn |
+| `capture_max_chars` | `8000` | Truncation limit per message |
+| `briefing_on_start` | `false` | Prepend the briefing card on a session's first turn |
+| `min_similarity` | unset | Floor for recall; unset defers to the server |
 
 ### Memory server flags
 
@@ -254,7 +339,7 @@ Config is stored in `~/.hermes/astral-memory.json`:
 | `--deep-rerank-url` | `http://localhost:8082` | Reranker sidecar URL |
 | `--hyde` | off | Enable HyDE query expansion |
 | `--data-path` | `./data/mask` | Where memories are stored |
-| `--activate KEY` | — | Activate with license key |
+| `--activate KEY` | — | Activate with a license key |
 | `--no-license` | — | Skip license (debug builds only) |
 
 ### Reranker sidecar flags
@@ -271,14 +356,16 @@ Config is stored in `~/.hermes/astral-memory.json`:
 
 ```
 memory-hermes/
-├── astral-memory/          ← Plugin source (copy as astral_memory/)
-│   ├── __init__.py         ← MemoryProvider implementation
-│   ├── schemas.py          ← Tool schemas for LLM
-│   ├── tools.py            ← Deprecated (v1 compat stub)
-│   └── plugin.yaml         ← Plugin manifest
-├── rerank_server.py        ← MiniLM reranker sidecar (new in v2.1.0)
+├── astral-memory/              ← Plugin source (install as astral_memory/)
+│   ├── __init__.py             ← MemoryProvider implementation
+│   ├── schemas.py              ← Tool schemas for the LLM
+│   └── plugin.yaml             ← Plugin manifest
+├── rerank_server.py            ← MiniLM reranker sidecar
 ├── skills/
-│   └── astral-memory.md    ← Agent skill file
+│   └── astral-memory.md        ← Agent skill file
+├── tests/
+│   └── test_provider_contract.py   ← Guards against interface drift
+├── .github/workflows/ci.yml    ← Pinned contract job + nightly upstream canary
 ├── pyproject.toml
 ├── README.md
 └── LICENSE
@@ -286,56 +373,66 @@ memory-hermes/
 
 ### Install mapping
 
-| Source repo path | Install path in Hermes |
+| Source repo path | Install path |
 |---|---|
-| `astral-memory/` | `plugins/memory/astral_memory/` |
+| `astral-memory/` | `<hermes-agent>/plugins/memory/astral_memory/` |
 | `skills/astral-memory.md` | `~/.hermes/skills/astral-memory.md` |
-| `rerank_server.py` | anywhere on PATH (runs standalone) |
+| `rerank_server.py` | anywhere on `PATH` (runs standalone) |
 
 ---
 
 ## Troubleshooting
+
+### Memory stopped working after updating Hermes
+
+The most likely cause is a plugin/Hermes version mismatch — see
+[Compatibility](#compatibility). Plugin 2.1.0 on Hermes ≥ v0.18.0 fails
+silently. Upgrade to 2.2.0.
+
+To confirm, run Hermes with debug logging and look for provider errors:
+
+```bash
+hermes --log-level DEBUG 2>&1 | grep -i "astral\|memory provider"
+```
+
+A line reading `prefetch failed (non-fatal)` or `sync_turn failed` on every
+turn is the signature. From 2.2.0 onward, an incompatible build logs an
+explicit `ERROR` naming the offending method at startup.
 
 ### Plugin shows as `×` in `/plugins`
 
 The config key must match the directory name exactly:
 
 ```bash
-# WRONG — hyphen
-hermes config set memory.provider astral-memory
-
-# CORRECT — underscore (matches directory name)
-hermes config set memory.provider astral_memory
+hermes config set memory.provider astral-memory   # WRONG — hyphen
+hermes config set memory.provider astral_memory   # CORRECT — underscore
 ```
 
-### "Connection refused" on localhost:8090
+### `ImportError: agent.memory_provider`
 
-Start the memory server:
+The plugin is installed outside a Hermes tree, or Hermes is too old. From
+2.2.0 this is deliberately fatal rather than silently degrading — an earlier
+fallback stub is exactly what let the v2.1.0 outage go unnoticed.
 
-```bash
-./astral-memory-server --embed-url http://localhost:8081 \
-  --deep-rerank --deep-rerank-url http://localhost:8082 --hyde
-```
+### "Connection refused" on `localhost:8090`
 
-### "Connection refused" on localhost:8082
+The memory server is not running. Start it (step 3c). The plugin will log a
+warning at startup and memory will be inactive for the session.
 
-Start the reranker sidecar:
+### "Connection refused" on `localhost:8082`
 
-```bash
-python3 rerank_server.py --port 8082
-```
-
-The memory server will work without the reranker — it falls back to
-cosine-only ranking. But retrieval quality will be noticeably lower.
+The reranker sidecar is not running. The memory server falls back to
+cosine-only ranking; retrieval works, less accurately.
 
 ### No memories being stored
 
-Check that the embedding server is running on port 8081. Memories
-can't be stored without embeddings.
+Check the embedding server on port 8081. Without embeddings, nothing can be
+written. Then check `astral_stats` — if `total_memories` is climbing, capture
+is working and the issue is retrieval, not storage.
 
 ### Search returns nothing useful
 
-If the embedding model changed since memories were stored:
+If the embedding model changed since your memories were written:
 
 ```bash
 ./astral-memory-server --rebuild-embeddings
@@ -343,15 +440,12 @@ If the embedding model changed since memories were stored:
 
 ### Circuit breaker triggered
 
-If the memory server goes down, the plugin stops sending requests
-after 3 consecutive failures and retries after 60 seconds. Restart
-the memory server and it recovers automatically.
+After 3 consecutive failures the plugin stops sending requests for 60 seconds,
+then retries. Restart the memory server; it recovers on its own.
 
 ### Reranker model download slow
 
-The first run of `rerank_server.py` downloads the MiniLM model (~90MB)
-from Hugging Face. On slow connections, set `HF_HUB_DOWNLOAD_TIMEOUT`
-to increase the timeout, or pre-download:
+First run downloads ~90MB from Hugging Face. Pre-download:
 
 ```bash
 python3 -c "from sentence_transformers import CrossEncoder; CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')"
@@ -361,13 +455,12 @@ python3 -c "from sentence_transformers import CrossEncoder; CrossEncoder('cross-
 
 ## Coming from OpenClaw?
 
-Both plugins share the same memory backend on `localhost:8090` — zero
-migration needed. Your memory corpus, briefing cards, and diary entries
-all carry over.
+Both plugins share the same memory backend on `localhost:8090` — no migration.
+Your corpus, briefing cards and diary entries carry over.
 
 ---
 
-## Competitive Comparison
+## Comparison
 
 | Feature | Hermes built-in | Mem0 | **Astral Core** |
 |---------|----------------|------|----------------|
@@ -378,42 +471,52 @@ all carry over.
 | Memory lifecycle | None | None | **5-tier + dormancy** |
 | Session diary | No | No | **Yes** |
 | Cross-device sync | No | No | **Yes (Fortress)** |
-| Cost after install | $0 | ~$5-15/mo | **$0** |
+| Cost after install | $0 | ~$5–15/mo | **$0** |
 
 ---
 
 ## Architecture
 
-Astral Core Memory is part of the [Astral Core](https://github.com/Suo-commerce/astralcore)
-project — a memory engine built for privacy-first, offline-capable
-AI assistants.
-
 | Component | Port | What it does |
 |-----------|------|-------------|
 | Embedding server | 8081 | nomic-embed-text via llama-server |
-| Reranker sidecar | 8082 | MiniLM cross-encoder via sentence-transformers |
+| Reranker sidecar | 8082 | MiniLM cross-encoder |
 | Memory server | 8090 | MASK/HOPE pipeline, REST API |
-| This Hermes plugin | — | MemoryProvider bridge |
+| This plugin | — | `MemoryProvider` bridge |
 | [OpenClaw plugin](https://github.com/Suo-commerce/memory-openclaw) | — | Bridge to OpenClaw |
-| Orbital Fortress | remote | Fleet sync server |
+| Orbital Fortress | remote | Fleet sync |
 
-Both Hermes and OpenClaw plugins share the same memory backend.
-Switch agents without losing a single memory.
+---
+
+## Contributing
+
+The contract guard is not optional. If you change `astral-memory/__init__.py`:
+
+```bash
+git clone --depth 1 --branch v2026.7.1 \
+  https://github.com/NousResearch/hermes-agent .hermes-src
+
+ASTRAL_CONTRACT_REQUIRE=1 PYTHONPATH=.hermes-src pytest tests/ -v
+```
+
+`ASTRAL_CONTRACT_REQUIRE=1` turns a missing Hermes into a failure rather than
+a skip. A skipped guard is a guard that has quietly stopped guarding — which
+is the whole reason this repository now has one.
 
 ---
 
 ## Links
 
 - [Get a license](https://orbitalfortress.com) — €19, one-time
-- [OpenClaw Plugin](https://github.com/Suo-commerce/memory-openclaw)
+- [OpenClaw plugin](https://github.com/Suo-commerce/memory-openclaw)
 - [Report an issue](https://github.com/Suo-commerce/memory-hermes/issues)
 
 ## License
 
-MIT — see [LICENSE](./LICENSE) for details.
+MIT — see [LICENSE](./LICENSE).
 
-The plugin is open source. The Astral Core memory server binary
-requires a [license](https://orbitalfortress.com) (€19 one-time).
+The plugin is open source. The Astral Core memory server binary requires a
+[license](https://orbitalfortress.com) (€19 one-time).
 
 ---
 
@@ -421,6 +524,6 @@ requires a [license](https://orbitalfortress.com) (€19 one-time).
 
 **Your AI should remember you without phoning home.**
 
-[Get Started](#quick-start) · [Orbital Fortress](https://orbitalfortress.com) · [Report Issue](https://github.com/Suo-commerce/memory-hermes/issues)
+[Get Started](#quick-start) · [Orbital Fortress](https://orbitalfortress.com) · [Report an issue](https://github.com/Suo-commerce/memory-hermes/issues)
 
 </div>

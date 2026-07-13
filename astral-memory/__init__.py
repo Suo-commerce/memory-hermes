@@ -1,24 +1,63 @@
-# Generation Timestamp: 2026-05-21T10:15:00Z
+# Generation Timestamp: 2026-07-09T00:00:00Z
+#
+# astral-memory/__init__.py
+# v2.2.0 CHANGES (contract repair for Hermes Agent >= v2026.7.1 / v0.18.0):
+#   BREAKING FIX — prefetch()/queue_prefetch()/sync_turn() now accept the
+#     keyword-only `session_id` argument that MemoryManager passes on every
+#     call. Under v2.2.0 of Hermes these raised TypeError, which the manager
+#     swallowed at DEBUG (prefetch) and WARNING (sync_turn) level. Net effect:
+#     auto-recall and auto-capture were silently dead. This is the bug.
+#   BREAKING FIX — handle_tool_call() renamed first param to `tool_name` and
+#     now accepts **kwargs, matching the ABC.
+#   FIX — on_pre_compress() now returns str (contribution to the compression
+#     summary prompt) instead of None.
+#   FIX — removed the MemoryProvider fallback stub. It froze the v0.17-era
+#     contract and made this exact drift invisible during local testing.
+#     A missing `agent.memory_provider` is now a loud ImportError.
+#   NEW — on_session_switch(): resets/reassigns per-session state. Previously
+#     `_session_id` was captured once in initialize() and never updated, so
+#     every write after a /new, /reset, /branch, /resume or context compression
+#     was tagged with a stale source id. Silent corpus pollution.
+#   NEW — on_delegation(): subagents run with skip_memory=True, so the parent
+#     provider is the only place delegation results can land. They were
+#     previously discarded.
+#   NEW — on_turn_start(): turn counter + periodic consolidation trigger.
+#   NEW — backup_paths(): declares the Astral data dir so `hermes backup`
+#     captures the corpus. Callable without initialize() and without network.
+#   NEW — on_memory_write() accepts the `metadata` provenance dict.
+#   NEW — _assert_contract(): introspects the live ABC at register() time and
+#     logs a loud ERROR on any signature drift, so the next breaking change
+#     surfaces as a startup error rather than a support ticket.
+#   CHANGE — prefetch cache is now keyed by session_id (was a single slot;
+#     concurrent gateway sessions could read each other's context).
+#   CHANGE — unbounded per-turn thread spawning replaced with a bounded
+#     ThreadPoolExecutor(max_workers=2).
+#   CHANGE — config keys documented in the README are now actually read:
+#     briefing_on_start, min_similarity, data_dir.
+#   REMOVED — nothing. tools.py deletion is a separate change.
 """
 Astral Core Memory — Hermes Agent Memory Provider Plugin
-Version: 2.1.0
+Version: 2.2.0
 
 Offline-first persistent memory with surprise-gated learning.
 Implements the MemoryProvider ABC for proper Hermes integration.
 
 Install:
-  Copy this directory to ~/.hermes/plugins/memory/astral-memory/
-  Set memory.provider: astral-memory in ~/.hermes/config.yaml
+  Copy this directory to <hermes-agent>/plugins/memory/astral_memory/
+  (underscore — Hermes matches memory.provider against the directory name)
+
+  hermes config set memory.provider astral_memory
+
+Requires:
+  Hermes Agent >= v2026.7.1 (v0.18.0). Earlier releases use a different
+  MemoryProvider signature; pin astral-memory-hermes==2.1.0 for those.
 
 Architecture:
-  Thin HTTP bridge → Astral Core memory server (:8090).
+  Thin HTTP bridge -> Astral Core memory server (:8090).
   The server runs the full MASK/HOPE pipeline — surprise gating,
   Delta Rule matrix, 5-tier lifecycle, hybrid retrieval (HyDE +
   cross-encoder reranking + session expansion), Dreamer consolidation.
   This plugin just talks to it.
-
-v2.1.0: Server-side cross-encoder reranking (MiniLM sidecar on :8082)
-  and HyDE query expansion. All retrieval intelligence is server-side.
 
 Repository: https://github.com/Suo-commerce/memory-hermes
 License: MIT
@@ -26,15 +65,22 @@ License: MIT
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import requests
+
+# Hard import. If this fails the plugin is installed against an
+# incompatible Hermes and must not silently degrade — see v2.1.0, where a
+# fallback stub encoding the old contract hid a total memory outage.
+from agent.memory_provider import MemoryProvider
 
 from . import schemas
 
@@ -44,58 +90,74 @@ logger = logging.getLogger("astral-memory")
 # Constants
 # ---------------------------------------------------------------------------
 
-_VERSION = "2.1.0"
+_VERSION = "2.2.0"
 _DEFAULT_SERVER_URL = "http://localhost:8090"
+_DEFAULT_DATA_DIR = "~/.astral"
+
 _CONNECT_TIMEOUT = 3.0
 _REQUEST_TIMEOUT = 10.0
-_PREFETCH_TIMEOUT = 5.0
 
 # Circuit breaker — stop hammering a dead server
 _CB_THRESHOLD = 3
 _CB_RESET_SECONDS = 60
 
+# Background work: prefetch + capture. Two is enough; more just queues
+# writes behind a wedged server.
+_MAX_WORKERS = 2
+
+# Consolidation nudge cadence (turns). 0 disables.
+_CONSOLIDATE_EVERY_N_TURNS = 50
+
 
 # ---------------------------------------------------------------------------
-# HTTP helpers — requests (bundled with Hermes)
+# HTTP helpers
 # ---------------------------------------------------------------------------
 
 class _HttpClient:
-    """HTTP client with circuit breaker for the memory server."""
+    """HTTP client with a thread-safe circuit breaker."""
 
     def __init__(self, base_url: str):
         self.base_url = base_url.rstrip("/")
+        self._lock = threading.Lock()
         self._failures = 0
         self._circuit_open_at: float = 0.0
 
-    @property
     def _circuit_open(self) -> bool:
-        if self._failures < _CB_THRESHOLD:
-            return False
-        if time.monotonic() - self._circuit_open_at > _CB_RESET_SECONDS:
+        with self._lock:
+            if self._failures < _CB_THRESHOLD:
+                return False
+            if time.monotonic() - self._circuit_open_at > _CB_RESET_SECONDS:
+                self._failures = 0
+                return False
+            return True
+
+    def _record_failure(self) -> None:
+        with self._lock:
+            self._failures += 1
+            if self._failures == _CB_THRESHOLD:
+                self._circuit_open_at = time.monotonic()
+                logger.warning(
+                    "Circuit breaker open — suppressing requests to %s for %ds",
+                    self.base_url, _CB_RESET_SECONDS,
+                )
+
+    def _record_success(self) -> None:
+        with self._lock:
             self._failures = 0
-            return False
-        return True
 
-    def _record_failure(self):
-        self._failures += 1
-        if self._failures >= _CB_THRESHOLD:
-            self._circuit_open_at = time.monotonic()
-            logger.warning(
-                "Circuit breaker open — suppressing requests to %s for %ds",
-                self.base_url, _CB_RESET_SECONDS,
-            )
-
-    def _record_success(self):
-        self._failures = 0
-
-    def get(self, path: str, timeout: float = _REQUEST_TIMEOUT,
-            params: dict | None = None) -> dict:
-        if self._circuit_open:
+    def _request(self, method: str, path: str, *,
+                 payload: Optional[dict] = None,
+                 params: Optional[dict] = None,
+                 timeout: float = _REQUEST_TIMEOUT) -> dict:
+        if self._circuit_open():
             return {"error": "circuit_breaker_open"}
         try:
-            r = requests.get(
+            r = requests.request(
+                method,
                 f"{self.base_url}{path}",
-                params=params, timeout=timeout,
+                json=payload if method in ("POST", "PUT", "PATCH") else None,
+                params=params,
+                timeout=timeout,
             )
             r.raise_for_status()
             self._record_success()
@@ -107,78 +169,32 @@ class _HttpClient:
             self._record_failure()
             return {"error": f"Request timed out ({timeout}s)"}
         except requests.HTTPError as e:
-            self._record_success()  # server is alive, just returned error
+            # Server is alive — it just said no. Don't trip the breaker.
+            self._record_success()
             try:
                 body = e.response.json()
             except Exception:
                 body = {"detail": e.response.text[:200]}
             return {"error": f"HTTP {e.response.status_code}", **body}
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — never let a bridge kill a turn
             self._record_failure()
             return {"error": str(e)}
 
-    def post(self, path: str, payload: dict | None = None,
+    def get(self, path: str, params: Optional[dict] = None,
+            timeout: float = _REQUEST_TIMEOUT) -> dict:
+        return self._request("GET", path, params=params, timeout=timeout)
+
+    def post(self, path: str, payload: Optional[dict] = None,
              timeout: float = _REQUEST_TIMEOUT) -> dict:
-        if self._circuit_open:
-            return {"error": "circuit_breaker_open"}
-        try:
-            r = requests.post(
-                f"{self.base_url}{path}",
-                json=payload or {}, timeout=timeout,
-            )
-            r.raise_for_status()
-            self._record_success()
-            return r.json()
-        except requests.ConnectionError:
-            self._record_failure()
-            return {"error": f"Memory server not reachable at {self.base_url}"}
-        except requests.Timeout:
-            self._record_failure()
-            return {"error": f"Request timed out ({timeout}s)"}
-        except requests.HTTPError as e:
-            self._record_success()
-            try:
-                body = e.response.json()
-            except Exception:
-                body = {"detail": e.response.text[:200]}
-            return {"error": f"HTTP {e.response.status_code}", **body}
-        except Exception as e:
-            self._record_failure()
-            return {"error": str(e)}
+        return self._request("POST", path, payload=payload or {}, timeout=timeout)
 
     def delete(self, path: str, timeout: float = _REQUEST_TIMEOUT) -> dict:
-        if self._circuit_open:
-            return {"error": "circuit_breaker_open"}
-        try:
-            r = requests.delete(
-                f"{self.base_url}{path}", timeout=timeout,
-            )
-            r.raise_for_status()
-            self._record_success()
-            return r.json()
-        except requests.ConnectionError:
-            self._record_failure()
-            return {"error": f"Memory server not reachable at {self.base_url}"}
-        except requests.Timeout:
-            self._record_failure()
-            return {"error": f"Request timed out ({timeout}s)"}
-        except requests.HTTPError as e:
-            self._record_success()
-            try:
-                body = e.response.json()
-            except Exception:
-                body = {"detail": e.response.text[:200]}
-            return {"error": f"HTTP {e.response.status_code}", **body}
-        except Exception as e:
-            self._record_failure()
-            return {"error": str(e)}
+        return self._request("DELETE", path, timeout=timeout)
 
-    def health(self) -> dict | None:
-        """Health check with short timeout.  Returns None on failure."""
+    def health(self) -> Optional[dict]:
+        """Health check with a short timeout. Returns None on failure."""
         try:
-            r = requests.get(
-                f"{self.base_url}/health", timeout=_CONNECT_TIMEOUT,
-            )
+            r = requests.get(f"{self.base_url}/health", timeout=_CONNECT_TIMEOUT)
             if r.status_code == 200:
                 return r.json()
         except Exception:
@@ -187,34 +203,33 @@ class _HttpClient:
 
 
 # ---------------------------------------------------------------------------
-# MemoryProvider implementation
+# Config
 # ---------------------------------------------------------------------------
 
-try:
-    from agent.memory_provider import MemoryProvider
-except ImportError:
-    # Fallback for development/testing outside Hermes
-    class MemoryProvider:  # type: ignore[no-redef]
-        """Stub ABC when running outside Hermes."""
-        @property
-        def name(self) -> str: ...
-        def is_available(self) -> bool: ...
-        def initialize(self, session_id: str, **kwargs) -> None: ...
-        def get_tool_schemas(self) -> list: ...
-        def handle_tool_call(self, name: str, args: dict) -> str: ...
-        def get_config_schema(self) -> list: ...
-        def save_config(self, values: dict, hermes_home: str) -> None: ...
-        def prefetch(self, query: str) -> str | None: ...
-        def queue_prefetch(self, query: str) -> None: ...
-        def sync_turn(self, user_content: str,
-                       assistant_content: str) -> None: ...
-        def on_session_end(self, messages: list) -> None: ...
-        def on_memory_write(self, action: str, target: str,
-                            content: str) -> None: ...
-        def on_pre_compress(self, messages: list) -> None: ...
-        def system_prompt_block(self) -> str | None: ...
-        def shutdown(self) -> None: ...
+def _config_path(hermes_home: str) -> Path:
+    return Path(hermes_home).expanduser() / "astral-memory.json"
 
+
+def _read_config(hermes_home: str) -> dict:
+    """Read the native config file. Safe to call before initialize()."""
+    path = _config_path(hermes_home)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+        return data if isinstance(data, dict) else {}
+    except Exception as e:  # noqa: BLE001
+        logger.debug("Could not read config at %s: %s", path, e)
+        return {}
+
+
+def _default_hermes_home() -> str:
+    return os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
+
+
+# ---------------------------------------------------------------------------
+# MemoryProvider implementation
+# ---------------------------------------------------------------------------
 
 class AstralCoreMemoryProvider(MemoryProvider):
     """
@@ -222,30 +237,41 @@ class AstralCoreMemoryProvider(MemoryProvider):
 
     Talks to the Astral Core memory server over HTTP (localhost:8090).
     The server handles surprise gating, embeddings, retrieval, and
-    everything else.  This provider is a thin bridge.
+    everything else. This provider is a thin bridge.
     """
 
-    def __init__(self):
-        self._http: _HttpClient | None = None
-        self._session_id: str = ""
-        self._hermes_home: str = ""
+    def __init__(self) -> None:
+        self._http: Optional[_HttpClient] = None
+        self._hermes_home: str = _default_hermes_home()
         self._server_url: str = _DEFAULT_SERVER_URL
         self._server_healthy: bool = False
 
-        # Background thread management
-        self._sync_thread: threading.Thread | None = None
-        self._prefetch_thread: threading.Thread | None = None
-        self._prefetch_cache: str | None = None
-        self._prefetch_lock = threading.Lock()
+        # Session state. `_active_session_id` is the id Hermes last told us
+        # about; call sites may override it per-call via session_id=.
+        self._active_session_id: str = ""
+        self._state_lock = threading.RLock()
 
-        # Config (loaded in initialize)
+        # Prefetch cache, keyed by session_id. A single shared slot leaked
+        # context between concurrent gateway sessions in <= 2.1.0.
+        self._prefetch_cache: Dict[str, str] = {}
+
+        # Turn counters, keyed by session_id.
+        self._turn_counts: Dict[str, int] = {}
+
+        self._pool: Optional[ThreadPoolExecutor] = None
+        self._shutting_down = False
+
+        # Config
         self._auto_capture: bool = True
         self._auto_recall: bool = True
         self._max_recall: int = 5
         self._capture_max_chars: int = 8000
+        self._briefing_on_start: bool = False
+        self._min_similarity: Optional[float] = None
+        self._data_dir: str = _DEFAULT_DATA_DIR
 
     # ------------------------------------------------------------------
-    # Required: identity & availability
+    # Identity & availability
     # ------------------------------------------------------------------
 
     @property
@@ -253,46 +279,48 @@ class AstralCoreMemoryProvider(MemoryProvider):
         return "astral-memory"
 
     def is_available(self) -> bool:
-        """No network calls allowed here per Hermes contract.
-        We check if the server URL is configured — actual connectivity
-        is tested in initialize()."""
-        return True  # always available; server check is in initialize
+        """No network calls permitted here per the Hermes contract.
+        Connectivity is probed in initialize()."""
+        return True
 
     # ------------------------------------------------------------------
-    # Required: initialization
+    # Initialization
     # ------------------------------------------------------------------
 
     def initialize(self, session_id: str, **kwargs) -> None:
-        """Called once at agent startup."""
-        self._session_id = session_id
-        self._hermes_home = kwargs.get("hermes_home", str(Path.home() / ".hermes"))
-
-        # Load config from file
+        self._hermes_home = kwargs.get("hermes_home") or _default_hermes_home()
         self._load_config()
 
-        # Create HTTP client
+        with self._state_lock:
+            self._active_session_id = session_id
+            self._prefetch_cache.clear()
+            self._turn_counts.clear()
+
+        self._pool = ThreadPoolExecutor(
+            max_workers=_MAX_WORKERS,
+            thread_name_prefix="astral-memory",
+        )
         self._http = _HttpClient(self._server_url)
 
-        # Health check
         health = self._http.health()
         if health:
             self._server_healthy = True
-            rerank_status = "on" if health.get("deep_rerank_enabled") else "off"
-            hyde_status = "on" if health.get("hyde_enabled") else "off"
             logger.info(
-                "Astral Core Memory: %s v%s — %d memories, "
+                "Astral Core Memory v%s: %s (server v%s) — %d memories, "
                 "embedding=%s, rerank=%s, hyde=%s",
+                _VERSION,
                 health.get("status", "?"),
                 health.get("version", "?"),
                 health.get("total_memories", 0),
                 health.get("embedding_backend", "?"),
-                rerank_status,
-                hyde_status,
+                "on" if health.get("deep_rerank_enabled") else "off",
+                "on" if health.get("hyde_enabled") else "off",
             )
         else:
+            self._server_healthy = False
             logger.warning(
                 "Astral Core memory server not reachable at %s. "
-                "Start the three services:\n"
+                "Memory is INACTIVE for this session. Start the services:\n"
                 "  1. llama-server --model nomic-embed-text-v1.5.Q5_K_M.gguf "
                 "--port 8081 --embedding -b 4096 -ub 4096\n"
                 "  2. python3 rerank_server.py --port 8082\n"
@@ -301,37 +329,488 @@ class AstralCoreMemoryProvider(MemoryProvider):
                 self._server_url,
             )
 
-    def _load_config(self):
-        """Load plugin config from astral-memory.json in HERMES_HOME."""
-        config_path = Path(self._hermes_home) / "astral-memory.json"
-        if config_path.exists():
+    def _load_config(self) -> None:
+        cfg = _read_config(self._hermes_home)
+        self._server_url = cfg.get("server_url", self._server_url)
+        self._auto_capture = bool(cfg.get("auto_capture", self._auto_capture))
+        self._auto_recall = bool(cfg.get("auto_recall", self._auto_recall))
+        self._max_recall = int(cfg.get("max_recall_memories", self._max_recall))
+        self._capture_max_chars = int(
+            cfg.get("capture_max_chars", self._capture_max_chars)
+        )
+        self._briefing_on_start = bool(
+            cfg.get("briefing_on_start", self._briefing_on_start)
+        )
+        if cfg.get("min_similarity") is not None:
             try:
-                cfg = json.loads(config_path.read_text())
-                self._server_url = cfg.get("server_url", self._server_url)
-                self._auto_capture = cfg.get("auto_capture", self._auto_capture)
-                self._auto_recall = cfg.get("auto_recall", self._auto_recall)
-                self._max_recall = cfg.get("max_recall_memories", self._max_recall)
-                self._capture_max_chars = cfg.get(
-                    "capture_max_chars", self._capture_max_chars,
-                )
-            except Exception as e:
-                logger.debug("Could not load config: %s", e)
+                self._min_similarity = float(cfg["min_similarity"])
+            except (TypeError, ValueError):
+                self._min_similarity = None
+        self._data_dir = cfg.get("data_dir", self._data_dir)
 
-        # Environment override
         env_url = os.environ.get("ASTRAL_SERVER_URL")
         if env_url:
             self._server_url = env_url
 
     # ------------------------------------------------------------------
-    # Required: config schema (for `hermes memory setup`)
+    # Internal helpers
     # ------------------------------------------------------------------
 
-    def get_config_schema(self) -> list:
+    def _sid(self, session_id: str = "") -> str:
+        """Resolve the effective session id for a call."""
+        if session_id:
+            return session_id
+        with self._state_lock:
+            return self._active_session_id
+
+    def _submit(self, fn, *args, **kwargs) -> None:
+        """Fire-and-forget background work. Never raises into the turn."""
+        if self._pool is None or self._shutting_down:
+            return
+        try:
+            self._pool.submit(fn, *args, **kwargs)
+        except RuntimeError:
+            # Pool already shut down mid-turn.
+            pass
+
+    def _ready(self) -> bool:
+        return self._http is not None
+
+    # ------------------------------------------------------------------
+    # Tools
+    # ------------------------------------------------------------------
+
+    def get_tool_schemas(self) -> List[Dict[str, Any]]:
+        return [
+            schemas.ASTRAL_RECALL,
+            schemas.ASTRAL_STORE,
+            schemas.ASTRAL_FORGET,
+            schemas.ASTRAL_BRIEFING,
+            schemas.ASTRAL_DIARY,
+            schemas.ASTRAL_STATS,
+            schemas.ASTRAL_SYNC,
+        ]
+
+    def handle_tool_call(self, tool_name: str, args: Dict[str, Any],
+                         **kwargs) -> str:
+        """Dispatch a tool call. Must return a JSON string.
+
+        `kwargs` may carry session_id and other context in future Hermes
+        releases; accept and ignore what we don't use.
+        """
+        if not self._ready():
+            return json.dumps({"error": "Astral Core provider not initialized"})
+
+        session_id = self._sid(kwargs.get("session_id", ""))
+
+        dispatch = {
+            "astral_recall":   self._tool_recall,
+            "astral_store":    self._tool_store,
+            "astral_forget":   self._tool_forget,
+            "astral_briefing": self._tool_briefing,
+            "astral_diary":    self._tool_diary,
+            "astral_stats":    self._tool_stats,
+            "astral_sync":     self._tool_sync,
+        }
+
+        handler = dispatch.get(tool_name)
+        if handler is None:
+            return json.dumps({"error": f"Unknown tool: {tool_name}"})
+
+        try:
+            return handler(args, session_id)
+        except Exception as e:  # noqa: BLE001
+            logger.error("Tool %s failed: %s", tool_name, e)
+            return json.dumps({"error": str(e)})
+
+    def _tool_recall(self, args: dict, session_id: str) -> str:
+        payload = {
+            "query": args.get("query", ""),
+            "limit": args.get("limit", self._max_recall),
+        }
+        if self._min_similarity is not None:
+            payload["min_similarity"] = self._min_similarity
+        return json.dumps(
+            self._http.post("/v1/memory/search", payload),
+            indent=2, default=str,
+        )
+
+    def _tool_store(self, args: dict, session_id: str) -> str:
+        text = args.get("text", "")
+        if not text:
+            return json.dumps({"error": "text is required"})
+        category = args.get("category", "fact")
+        return json.dumps(
+            self._http.post("/v1/memory/ingest", {
+                "user_message": text,
+                "assistant_response": f"Stored as {category}.",
+                "source": f"hermes_explicit_{session_id}" if session_id
+                          else "hermes_explicit",
+            }),
+            indent=2, default=str,
+        )
+
+    def _tool_forget(self, args: dict, session_id: str) -> str:
+        source = args.get("source", "")
+        if not source:
+            return json.dumps({"error": "source is required"})
+        return json.dumps(
+            self._http.delete(f"/v1/memory/source/{source}"),
+            indent=2, default=str,
+        )
+
+    def _tool_briefing(self, args: dict, session_id: str) -> str:
+        return json.dumps(
+            self._http.get("/v1/memory/briefing",
+                           params={"max_tokens": args.get("max_tokens", 200)}),
+            indent=2, default=str,
+        )
+
+    def _tool_diary(self, args: dict, session_id: str) -> str:
+        action = args.get("action", "read")
+        if action == "write":
+            text = args.get("text", "")
+            if not text:
+                return json.dumps({"error": "text is required for diary write"})
+            result = self._http.post("/v1/diary/write", {
+                "entry_text": text,
+                "agent_id": "hermes",
+                "entry_type": args.get("entry_type", "note"),
+                "session_id": session_id,
+            })
+        else:
+            result = self._http.get("/v1/diary/read", params={
+                "limit": args.get("limit", 10),
+                "agent_id": "hermes",
+            })
+        return json.dumps(result, indent=2, default=str)
+
+    def _tool_stats(self, args: dict, session_id: str) -> str:
+        return json.dumps(self._http.get("/v1/memory/stats"),
+                          indent=2, default=str)
+
+    def _tool_sync(self, args: dict, session_id: str) -> str:
+        return json.dumps(self._http.post("/v1/sync/trigger"),
+                          indent=2, default=str)
+
+    # ------------------------------------------------------------------
+    # System prompt
+    # ------------------------------------------------------------------
+
+    def system_prompt_block(self) -> str:
+        if not self._server_healthy:
+            return ""
+        return (
+            "[Astral Core Memory active — surprise-gated, offline, "
+            f"{self._max_recall} memories per turn. "
+            "Use astral_recall before answering from past context.]"
+        )
+
+    # ------------------------------------------------------------------
+    # Recall — prefetch / queue_prefetch
+    # ------------------------------------------------------------------
+
+    def prefetch(self, query: str, *, session_id: str = "") -> str:
+        """Recall context for the upcoming turn. Fast: prefer the cache."""
+        if not self._auto_recall or not self._ready():
+            return ""
+
+        sid = self._sid(session_id)
+
+        with self._state_lock:
+            cached = self._prefetch_cache.pop(sid, None)
+        if cached:
+            return cached
+
+        # Synchronous fallback — first turn of a session, or the background
+        # warm hasn't landed yet.
+        return self._do_prefetch(query, sid)
+
+    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+        """Warm the cache for the next turn. Non-blocking.
+
+        MemoryManager already dispatches this on a background worker, so we
+        do the work inline rather than spawning a second thread.
+        """
+        if not self._auto_recall or not self._ready():
+            return
+        sid = self._sid(session_id)
+        result = self._do_prefetch(query, sid)
+        if result:
+            with self._state_lock:
+                self._prefetch_cache[sid] = result
+
+    def _do_prefetch(self, query: str, session_id: str) -> str:
+        if not query.strip():
+            return ""
+        payload: Dict[str, Any] = {
+            "query": query,
+            "max_memories": self._max_recall,
+        }
+        if self._min_similarity is not None:
+            payload["min_similarity"] = self._min_similarity
+
+        data = self._http.post("/v1/memory/augmented-prompt", payload)
+        if "error" in data:
+            logger.debug("Prefetch failed (non-fatal): %s", data["error"])
+            return ""
+
+        block = str(data.get("context_block", "") or "")
+
+        # Optional: prepend the briefing card on the first recall of a session.
+        if self._briefing_on_start:
+            with self._state_lock:
+                first = self._turn_counts.get(session_id, 0) <= 1
+            if first:
+                card = self._http.get("/v1/memory/briefing",
+                                      params={"max_tokens": 200})
+                text = str(card.get("briefing", "") or "") if "error" not in card else ""
+                if text:
+                    block = f"{text}\n\n{block}".strip()
+
+        return block
+
+    # ------------------------------------------------------------------
+    # Capture — sync_turn
+    # ------------------------------------------------------------------
+
+    def sync_turn(
+        self,
+        user_content: str,
+        assistant_content: str,
+        *,
+        session_id: str = "",
+        messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        """Persist a completed turn. Must be non-blocking."""
+        if not self._auto_capture or not self._ready():
+            return
+
+        sid = self._sid(session_id)
+
+        def _sync() -> None:
+            result = self._http.post("/v1/memory/ingest", {
+                "user_message": user_content[:self._capture_max_chars],
+                "assistant_response": assistant_content[:self._capture_max_chars],
+                "source": f"hermes_{sid}" if sid else "hermes",
+            })
+            if "error" in result:
+                logger.debug("sync_turn failed (non-fatal): %s", result["error"])
+
+        self._submit(_sync)
+
+    # ------------------------------------------------------------------
+    # Lifecycle hooks
+    # ------------------------------------------------------------------
+
+    def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
+        sid = self._sid(kwargs.get("session_id", ""))
+        with self._state_lock:
+            self._turn_counts[sid] = turn_number
+
+        if (_CONSOLIDATE_EVERY_N_TURNS
+                and turn_number > 0
+                and turn_number % _CONSOLIDATE_EVERY_N_TURNS == 0
+                and self._ready()):
+            self._submit(self._http.post, "/v1/memory/consolidate")
+
+    def on_session_switch(
+        self,
+        new_session_id: str,
+        *,
+        parent_session_id: str = "",
+        reset: bool = False,
+        rewound: bool = False,
+        **kwargs,
+    ) -> None:
+        """Reassign per-session state.
+
+        Without this, `_active_session_id` stayed frozen at whatever
+        initialize() saw, and every subsequent write was tagged with a stale
+        source id after /new, /reset, /branch, /resume, or compression.
+        """
+        with self._state_lock:
+            old = self._active_session_id
+            self._active_session_id = new_session_id
+
+            if reset:
+                # Genuinely new conversation — drop everything.
+                self._prefetch_cache.clear()
+                self._turn_counts.clear()
+            else:
+                # Continuation: carry the turn count forward, but never carry
+                # recalled context across an id boundary.
+                self._prefetch_cache.pop(old, None)
+                self._prefetch_cache.pop(new_session_id, None)
+                if old and old in self._turn_counts:
+                    self._turn_counts[new_session_id] = self._turn_counts.pop(old)
+
+            if rewound:
+                self._prefetch_cache.pop(new_session_id, None)
+
+        logger.debug(
+            "Session switch %s -> %s (reset=%s rewound=%s parent=%s)",
+            old or "<none>", new_session_id, reset, rewound,
+            parent_session_id or "<none>",
+        )
+
+    def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
+        """Capture turns about to be discarded, and contribute to the summary.
+
+        Returns text the compressor folds into its summarization prompt.
+        """
+        if not self._ready() or not messages:
+            return ""
+
+        sid = self._sid()
+
+        pairs: List[Dict[str, str]] = []
+        for i in range(len(messages) - 1):
+            if (messages[i].get("role") == "user"
+                    and messages[i + 1].get("role") == "assistant"):
+                user_text = str(messages[i].get("content", "") or "").strip()
+                asst_text = str(messages[i + 1].get("content", "") or "").strip()
+                if user_text and asst_text and len(user_text) > 20:
+                    pairs.append({
+                        "user": user_text[:self._capture_max_chars],
+                        "assistant": asst_text[:self._capture_max_chars],
+                    })
+
+        if not pairs:
+            return ""
+
+        batch = pairs[:10]
+
+        def _ingest() -> None:
+            result = self._http.post("/v1/memory/ingest/batch", {
+                "turns": batch,
+                "source": f"hermes_compress_{sid}" if sid else "hermes_compress",
+            })
+            if "error" in result:
+                logger.debug("Pre-compress capture failed: %s", result["error"])
+            else:
+                logger.debug("Pre-compress capture: %d pairs", len(batch))
+
+        self._submit(_ingest)
+
+        return (
+            f"[Astral Core] {len(batch)} conversation turn(s) from this span "
+            "have been persisted to long-term memory and remain retrievable "
+            "via astral_recall. The summary need not preserve their verbatim "
+            "detail — preserve decisions, constraints, and open threads."
+        )
+
+    def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+        """Write a diary summary when the session ends."""
+        if not self._ready() or not messages:
+            return
+
+        sid = self._sid()
+
+        lines: List[str] = []
+        for msg in messages[-6:]:
+            role = msg.get("role", "")
+            content = str(msg.get("content", "") or "").strip()[:500]
+            if content and role in ("user", "assistant"):
+                lines.append(f"[{'U' if role == 'user' else 'A'}] {content}")
+
+        if not lines:
+            return
+
+        # Synchronous: the pool may be torn down immediately after this.
+        result = self._http.post("/v1/diary/write", {
+            "entry_text": "\n".join(lines[-4:]),
+            "agent_id": "hermes",
+            "session_id": sid,
+            "entry_type": "summary",
+            "metadata": {"auto": True, "plugin": "astral-memory",
+                         "version": _VERSION},
+        })
+        if "error" in result:
+            logger.debug("Diary write failed: %s", result["error"])
+
+    def on_delegation(self, task: str, result: str, *,
+                      child_session_id: str = "", **kwargs) -> None:
+        """Capture what a subagent was asked and what it returned.
+
+        Subagents run with skip_memory=True — the parent provider is the only
+        place this can land. In <= 2.1.0 it was discarded entirely.
+        """
+        if not self._ready() or not task.strip() or not result.strip():
+            return
+
+        sid = self._sid(kwargs.get("session_id", ""))
+
+        def _ingest() -> None:
+            self._http.post("/v1/memory/ingest", {
+                "user_message": task[:self._capture_max_chars],
+                "assistant_response": result[:self._capture_max_chars],
+                "source": f"hermes_delegation_{child_session_id or sid}",
+            })
+
+        self._submit(_ingest)
+
+    def on_memory_write(
+        self,
+        action: str,
+        target: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Mirror built-in MEMORY.md / USER.md writes into Astral Core."""
+        if not self._ready() or not content.strip():
+            return
+        if action not in ("add", "replace"):
+            return
+
+        meta = dict(metadata or {})
+        sid = self._sid(str(meta.get("session_id", "")))
+
+        def _mirror() -> None:
+            self._http.post("/v1/memory/ingest", {
+                "user_message": content[:self._capture_max_chars],
+                "assistant_response": f"Mirrored from Hermes {target} ({action}).",
+                "source": f"hermes_builtin_{target}",
+                "metadata": {
+                    "mirrored": True,
+                    "session_id": sid,
+                    "write_origin": meta.get("write_origin"),
+                    "tool_name": meta.get("tool_name"),
+                },
+            })
+
+        self._submit(_mirror)
+
+    # ------------------------------------------------------------------
+    # Backup
+    # ------------------------------------------------------------------
+
+    def backup_paths(self) -> List[str]:
+        """Declare the Astral corpus so `hermes backup` captures it.
+
+        Contract: must work without initialize() and without network.
+        """
+        cfg = _read_config(_default_hermes_home())
+        data_dir = os.environ.get("ASTRAL_DATA_DIR") or cfg.get(
+            "data_dir", _DEFAULT_DATA_DIR
+        )
+        return [str(Path(data_dir).expanduser())]
+
+    # ------------------------------------------------------------------
+    # Config schema (`hermes memory setup`)
+    # ------------------------------------------------------------------
+
+    def get_config_schema(self) -> List[Dict[str, Any]]:
         return [
             {
                 "key": "server_url",
                 "description": "Astral Core memory server URL",
                 "default": _DEFAULT_SERVER_URL,
+            },
+            {
+                "key": "data_dir",
+                "description": "Astral Core data directory (backed up by `hermes backup`)",
+                "default": _DEFAULT_DATA_DIR,
             },
             {
                 "key": "auto_capture",
@@ -350,325 +829,113 @@ class AstralCoreMemoryProvider(MemoryProvider):
                 "description": "Maximum memories to inject per turn",
                 "default": "5",
             },
+            {
+                "key": "briefing_on_start",
+                "description": "Prepend the briefing card on the first turn of a session",
+                "default": "false",
+                "choices": ["true", "false"],
+            },
         ]
 
-    def save_config(self, values: dict, hermes_home: str) -> None:
-        """Write non-secret config to astral-memory.json."""
-        config_path = Path(hermes_home) / "astral-memory.json"
+    def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
+        """Merge into astral-memory.json rather than clobbering it."""
+        path = _config_path(hermes_home)
+        existing = _read_config(hermes_home)
 
-        # Coerce string booleans
-        for key in ("auto_capture", "auto_recall"):
-            if key in values and isinstance(values[key], str):
-                values[key] = values[key].lower() in ("true", "1", "yes")
+        coerced = dict(values)
+        for key in ("auto_capture", "auto_recall", "briefing_on_start"):
+            if key in coerced and isinstance(coerced[key], str):
+                coerced[key] = coerced[key].strip().lower() in ("true", "1", "yes")
 
-        # Coerce numeric
-        if "max_recall_memories" in values:
+        if "max_recall_memories" in coerced:
             try:
-                values["max_recall_memories"] = int(values["max_recall_memories"])
-            except (ValueError, TypeError):
-                values["max_recall_memories"] = 5
+                coerced["max_recall_memories"] = int(coerced["max_recall_memories"])
+            except (TypeError, ValueError):
+                coerced["max_recall_memories"] = 5
 
-        config_path.write_text(json.dumps(values, indent=2))
-        logger.info("Config saved to %s", config_path)
-
-    # ------------------------------------------------------------------
-    # Required: tools
-    # ------------------------------------------------------------------
-
-    def get_tool_schemas(self) -> list:
-        """Return tool schemas for LLM tool injection."""
-        return [
-            schemas.ASTRAL_RECALL,
-            schemas.ASTRAL_STORE,
-            schemas.ASTRAL_FORGET,
-            schemas.ASTRAL_BRIEFING,
-            schemas.ASTRAL_DIARY,
-            schemas.ASTRAL_STATS,
-            schemas.ASTRAL_SYNC,
-        ]
-
-    def handle_tool_call(self, name: str, args: dict) -> str:
-        """Dispatch tool calls to handlers."""
-        if not self._http:
-            return json.dumps({"error": "Provider not initialized"})
-
-        dispatch = {
-            "astral_recall":   self._tool_recall,
-            "astral_store":    self._tool_store,
-            "astral_forget":   self._tool_forget,
-            "astral_briefing": self._tool_briefing,
-            "astral_diary":    self._tool_diary,
-            "astral_stats":    self._tool_stats,
-            "astral_sync":     self._tool_sync,
-        }
-
-        handler = dispatch.get(name)
-        if not handler:
-            return json.dumps({"error": f"Unknown tool: {name}"})
-
-        try:
-            return handler(args)
-        except Exception as e:
-            logger.error("Tool %s failed: %s", name, e)
-            return json.dumps({"error": str(e)})
+        existing.update(coerced)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(existing, indent=2))
+        logger.info("Config saved to %s", path)
 
     # ------------------------------------------------------------------
-    # Tool implementations
+    # Shutdown
     # ------------------------------------------------------------------
-
-    def _tool_recall(self, args: dict) -> str:
-        query = args.get("query", "")
-        limit = args.get("limit", self._max_recall)
-        result = self._http.post("/v1/memory/search", {
-            "query": query,
-            "limit": limit,
-        })
-        return json.dumps(result, indent=2, default=str)
-
-    def _tool_store(self, args: dict) -> str:
-        text = args.get("text", "")
-        category = args.get("category", "fact")
-        if not text:
-            return json.dumps({"error": "text is required"})
-        result = self._http.post("/v1/memory/ingest", {
-            "user_message": text,
-            "assistant_response": f"Stored as {category}.",
-            "source": "hermes_explicit",
-        })
-        return json.dumps(result, indent=2, default=str)
-
-    def _tool_forget(self, args: dict) -> str:
-        source = args.get("source", "")
-        if not source:
-            return json.dumps({"error": "source is required"})
-        result = self._http.delete(f"/v1/memory/source/{source}")
-        return json.dumps(result, indent=2, default=str)
-
-    def _tool_briefing(self, args: dict) -> str:
-        max_tokens = args.get("max_tokens", 200)
-        result = self._http.get("/v1/memory/briefing", params={
-            "max_tokens": max_tokens,
-        })
-        return json.dumps(result, indent=2, default=str)
-
-    def _tool_diary(self, args: dict) -> str:
-        action = args.get("action", "read")
-        if action == "write":
-            text = args.get("text", "")
-            if not text:
-                return json.dumps({"error": "text is required for diary write"})
-            result = self._http.post("/v1/diary/write", {
-                "entry_text": text,
-                "agent_id": "hermes",
-                "entry_type": args.get("entry_type", "note"),
-                "session_id": self._session_id,
-            })
-        else:
-            result = self._http.get("/v1/diary/read", params={
-                "limit": args.get("limit", 10),
-                "agent_id": "hermes",
-            })
-        return json.dumps(result, indent=2, default=str)
-
-    def _tool_stats(self, args: dict) -> str:
-        result = self._http.get("/v1/memory/stats")
-        return json.dumps(result, indent=2, default=str)
-
-    def _tool_sync(self, args: dict) -> str:
-        result = self._http.post("/v1/sync/trigger")
-        return json.dumps(result, indent=2, default=str)
-
-    # ------------------------------------------------------------------
-    # Memory lifecycle hooks
-    # ------------------------------------------------------------------
-
-    def system_prompt_block(self) -> str | None:
-        """Static block appended to system prompt."""
-        if not self._server_healthy:
-            return None
-        return (
-            "[Astral Core Memory active — surprise-gated, offline, "
-            f"{self._max_recall} memories per turn. "
-            "Use astral_recall before answering from past context.]"
-        )
-
-    def prefetch(self, query: str) -> str | None:
-        """Called before each LLM call.  Return context to inject.
-
-        If queue_prefetch pre-warmed a result, use the cached value.
-        Otherwise do a synchronous fetch (blocks the turn briefly).
-        """
-        if not self._auto_recall or not self._http:
-            return None
-
-        # Check if queue_prefetch already has a result
-        with self._prefetch_lock:
-            cached = self._prefetch_cache
-            self._prefetch_cache = None
-
-        if cached:
-            return cached
-
-        # Synchronous fallback
-        return self._do_prefetch(query)
-
-    def queue_prefetch(self, query: str) -> None:
-        """Background pre-warm for next turn.  Non-blocking."""
-        if not self._auto_recall or not self._http:
-            return
-
-        def _bg():
-            result = self._do_prefetch(query)
-            with self._prefetch_lock:
-                self._prefetch_cache = result
-
-        # Wait for previous prefetch to finish
-        if self._prefetch_thread and self._prefetch_thread.is_alive():
-            self._prefetch_thread.join(timeout=2.0)
-
-        self._prefetch_thread = threading.Thread(target=_bg, daemon=True)
-        self._prefetch_thread.start()
-
-    def _do_prefetch(self, query: str) -> str | None:
-        """Fetch augmented prompt from memory server."""
-        if not query.strip():
-            return None
-        try:
-            data = self._http.post("/v1/memory/augmented-prompt", {
-                "query": query,
-                "max_memories": self._max_recall,
-            })
-            if "error" in data:
-                return None
-            block = data.get("context_block", "")
-            return block if block else None
-        except Exception as e:
-            logger.debug("Prefetch failed: %s", e)
-            return None
-
-    def sync_turn(self, user_content: str, assistant_content: str) -> None:
-        """Persist conversation turn.  MUST be non-blocking per contract."""
-        if not self._auto_capture or not self._http:
-            return
-
-        def _sync():
-            try:
-                self._http.post("/v1/memory/ingest", {
-                    "user_message": user_content[:self._capture_max_chars],
-                    "assistant_response": assistant_content[:self._capture_max_chars],
-                    "source": f"hermes_{self._session_id}",
-                })
-            except Exception as e:
-                logger.debug("sync_turn failed (non-fatal): %s", e)
-
-        # Wait for previous sync thread
-        if self._sync_thread and self._sync_thread.is_alive():
-            self._sync_thread.join(timeout=5.0)
-
-        self._sync_thread = threading.Thread(target=_sync, daemon=True)
-        self._sync_thread.start()
-
-    def on_session_end(self, messages: list) -> None:
-        """Write a diary summary when the session ends."""
-        if not self._http or not messages:
-            return
-
-        # Build summary from last few messages
-        tail = messages[-6:]
-        lines = []
-        for msg in tail:
-            role = msg.get("role", "")
-            content = str(msg.get("content", "")).strip()[:500]
-            if content and role in ("user", "assistant"):
-                prefix = "U" if role == "user" else "A"
-                lines.append(f"[{prefix}] {content}")
-
-        if not lines:
-            return
-
-        try:
-            self._http.post("/v1/diary/write", {
-                "entry_text": "\n".join(lines[-4:]),
-                "agent_id": "hermes",
-                "session_id": self._session_id,
-                "entry_type": "summary",
-                "metadata": {"auto": True, "plugin": "astral-memory",
-                              "version": _VERSION},
-            })
-            logger.debug("Session diary entry written")
-        except Exception as e:
-            logger.debug("Diary write failed: %s", e)
-
-    def on_pre_compress(self, messages: list) -> None:
-        """Save insights before Hermes discards old context."""
-        if not self._http or not messages:
-            return
-
-        # Extract user/assistant pairs about to be compressed
-        pairs = []
-        for i in range(len(messages) - 1):
-            if (messages[i].get("role") == "user" and
-                    messages[i + 1].get("role") == "assistant"):
-                user_text = str(messages[i].get("content", "")).strip()
-                asst_text = str(messages[i + 1].get("content", "")).strip()
-                if user_text and asst_text and len(user_text) > 20:
-                    pairs.append({
-                        "user": user_text[:self._capture_max_chars],
-                        "assistant": asst_text[:self._capture_max_chars],
-                    })
-
-        if not pairs:
-            return
-
-        def _ingest():
-            try:
-                self._http.post("/v1/memory/ingest/batch", {
-                    "turns": pairs[:10],
-                    "source": f"hermes_compress_{self._session_id}",
-                })
-                logger.debug("Pre-compress capture: %d pairs", len(pairs[:10]))
-            except Exception as e:
-                logger.debug("Pre-compress capture failed: %s", e)
-
-        t = threading.Thread(target=_ingest, daemon=True)
-        t.start()
-
-    def on_memory_write(self, action: str, target: str,
-                        content: str) -> None:
-        """Mirror built-in MEMORY.md / USER.md writes to Astral Core."""
-        if not self._http or not content.strip():
-            return
-
-        if action not in ("add", "replace"):
-            return
-
-        def _mirror():
-            try:
-                self._http.post("/v1/memory/ingest", {
-                    "user_message": content[:self._capture_max_chars],
-                    "assistant_response": (
-                        f"Mirrored from Hermes {target} ({action})."
-                    ),
-                    "source": f"hermes_builtin_{target}",
-                })
-            except Exception as e:
-                logger.debug("Memory mirror failed: %s", e)
-
-        t = threading.Thread(target=_mirror, daemon=True)
-        t.start()
 
     def shutdown(self) -> None:
-        """Clean up background threads."""
-        for thread in (self._sync_thread, self._prefetch_thread):
-            if thread and thread.is_alive():
-                thread.join(timeout=3.0)
+        self._shutting_down = True
+        if self._pool is not None:
+            self._pool.shutdown(wait=True, cancel_futures=False)
+            self._pool = None
         logger.debug("Astral Core Memory provider shut down")
 
 
 # ---------------------------------------------------------------------------
-# Plugin entry point — called by Hermes memory plugin discovery
+# Contract self-check
+# ---------------------------------------------------------------------------
+
+# (method_name, required parameter names beyond `self`)
+_CONTRACT: Dict[str, tuple] = {
+    "prefetch":        ("query", "session_id"),
+    "queue_prefetch":  ("query", "session_id"),
+    "sync_turn":       ("user_content", "assistant_content", "session_id"),
+    "handle_tool_call": ("tool_name", "args"),
+    "on_pre_compress": ("messages",),
+    "on_session_switch": ("new_session_id",),
+}
+
+
+def _assert_contract(provider: MemoryProvider) -> bool:
+    """Compare our overrides against the live ABC.
+
+    v2.1.0 shipped with `prefetch(self, query)` against an ABC that had moved
+    to `prefetch(self, query, *, session_id="")`. MemoryManager swallowed the
+    resulting TypeError at DEBUG level and memory silently stopped working.
+    This check turns the next such drift into a visible startup error.
+    """
+    ok = True
+    for method, required in _CONTRACT.items():
+        impl = getattr(provider, method, None)
+        base = getattr(MemoryProvider, method, None)
+        if impl is None or base is None:
+            logger.error(
+                "astral-memory: method '%s' missing from provider or from the "
+                "installed Hermes MemoryProvider ABC. Upgrade Hermes to "
+                ">= v2026.7.1 or pin astral-memory-hermes==2.1.0.", method,
+            )
+            ok = False
+            continue
+
+        try:
+            sig = inspect.signature(impl)
+        except (TypeError, ValueError):
+            continue
+
+        params = sig.parameters
+        accepts_kwargs = any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
+        for param in required:
+            if param not in params and not accepts_kwargs:
+                logger.error(
+                    "astral-memory: %s() does not accept '%s'. The installed "
+                    "Hermes will call it that way and the failure will be "
+                    "silent. This plugin build is incompatible.",
+                    method, param,
+                )
+                ok = False
+
+    if ok:
+        logger.debug("astral-memory: MemoryProvider contract check passed")
+    return ok
+
+
+# ---------------------------------------------------------------------------
+# Plugin entry point
 # ---------------------------------------------------------------------------
 
 def register(ctx) -> None:
     """Register the Astral Core memory provider with Hermes."""
-    ctx.register_memory_provider(AstralCoreMemoryProvider())
+    provider = AstralCoreMemoryProvider()
+    _assert_contract(provider)
+    ctx.register_memory_provider(provider)
