@@ -1,0 +1,321 @@
+# Generation Timestamp: 2026-07-09T00:00:00Z
+#
+# .github/workflows/ci.yml
+# v1.0.0 — first CI for Suo-commerce/memory-hermes.
+#
+# CONTEXT
+#   This repository had no CI. HERMES_PLUGIN_STRATEGY.md listed
+#   `.github/workflows/ci.yml` as a planned deliverable; it was never created.
+#   In the interim, Hermes moved MemoryProvider.prefetch() from
+#   `(self, query)` to `(self, query, *, session_id="")`. The plugin kept the
+#   old signature. MemoryManager caught the resulting TypeError at DEBUG level
+#   and memory silently stopped working for every user on Hermes >= v0.18.0.
+#
+#   The signature drift was inevitable. Not noticing it was not.
+#
+# JOB LAYOUT
+#   lint        — ruff, fast, fails first.
+#   contract    — the guard. Pinned Hermes, 3.11-3.13. Blocking.
+#   canary      — nightly, unpinned Hermes @ main. Non-blocking; files an
+#                 issue on failure. This is the job that gives early warning.
+#                 A pinned-only pipeline learns about upstream drift when
+#                 someone bumps the pin, i.e. too late.
+#   package     — pip install + import. Catches phantom entry points.
+#
+# PINNING POLICY
+#   HERMES_PINNED_REF is the release we assert compatibility with. Bump it
+#   deliberately, in a PR, with the contract suite green. If `canary` is red
+#   and `contract` is green, upstream has moved and we owe users a release.
+#
+# WHY PYTHONPATH AND NOT `pip install -e ./hermes-agent`
+#   agent/memory_provider.py imports only stdlib (logging, abc, typing), and
+#   agent/__init__.py is a docstring. The contract suite needs nothing else.
+#   Installing Hermes proper drags in its full dependency tree and pins us to
+#   its resolver. A shallow checkout on sys.path is seconds, not minutes.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # 04:17 UTC daily. Off the hour — GitHub's scheduler queues heavily at :00.
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # The Hermes release this plugin is verified against.
+  # Bump deliberately. See PINNING POLICY above.
+  HERMES_PINNED_REF: "v2026.7.1"
+  HERMES_REPO: "NousResearch/hermes-agent"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Ruff check
+        run: ruff check astral-memory tests
+
+      - name: Ruff format check
+        run: ruff format --check astral-memory tests
+
+      - name: Every source file carries a generation timestamp
+        # A house rule, and a real one: the v2.1.0 outage was easier to date
+        # because the file said when it was written.
+        run: |
+          fail=0
+          while IFS= read -r f; do
+            if ! head -n 3 "$f" | grep -q "Generation Timestamp:"; then
+              echo "::error file=$f::missing '# Generation Timestamp:' header"
+              fail=1
+            fi
+          done < <(find astral-memory tests -name '*.py')
+          exit $fail
+
+  # ---------------------------------------------------------------------------
+  contract:
+    name: Contract (Hermes ${{ needs.resolve.outputs.pinned }}, py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix:
+        # Hermes declares requires-python = ">=3.11,<3.14".
+        # Do not add 3.10 here; Hermes cannot run on it.
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - name: Checkout plugin
+        uses: actions/checkout@v4
+
+      - name: Checkout Hermes (pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.HERMES_REPO }}
+          ref: ${{ env.HERMES_PINNED_REF }}
+          path: .hermes-src
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Install test dependencies
+        run: pip install pytest requests
+
+      - name: Confirm the Hermes ABC is importable
+        # If this fails, everything downstream would "skip" and look green.
+        run: |
+          PYTHONPATH=.hermes-src python -c "
+          from agent.memory_provider import MemoryProvider
+          import inspect
+          print('MemoryProvider OK')
+          print('  prefetch:', inspect.signature(MemoryProvider.prefetch))
+          print('  sync_turn:', inspect.signature(MemoryProvider.sync_turn))
+          "
+
+      - name: Run contract guard
+        env:
+          # Hard-fail rather than skip if Hermes is missing. A skipped guard
+          # is a guard that has quietly stopped guarding.
+          ASTRAL_CONTRACT_REQUIRE: "1"
+          PYTHONPATH: .hermes-src
+        run: pytest tests/ -v --tb=short
+
+  # ---------------------------------------------------------------------------
+  resolve:
+    # Exposes the pinned ref as an output so job names render it.
+    name: Resolve pin
+    runs-on: ubuntu-latest
+    outputs:
+      pinned: ${{ steps.p.outputs.ref }}
+    steps:
+      - id: p
+        run: echo "ref=${HERMES_PINNED_REF}" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  canary:
+    name: Canary (Hermes @ main)
+    runs-on: ubuntu-latest
+    # Never blocks a merge. Its job is to tell us upstream moved, not to stop us.
+    continue-on-error: true
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout plugin
+        uses: actions/checkout@v4
+
+      - name: Checkout Hermes (main)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.HERMES_REPO }}
+          ref: main
+          path: .hermes-src
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install test dependencies
+        run: pip install pytest requests
+
+      - name: Record upstream HEAD
+        id: head
+        run: |
+          cd .hermes-src
+          echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "date=$(git log -1 --format=%cs)" >> "$GITHUB_OUTPUT"
+
+      - name: Diff the ABC against our pin
+        # Informational. A changed ABC is not itself a failure — a changed ABC
+        # we no longer satisfy is, and the suite below decides that.
+        continue-on-error: true
+        run: |
+          git -C .hermes-src fetch --depth=1 origin "$HERMES_PINNED_REF" || true
+          echo "--- agent/memory_provider.py: $HERMES_PINNED_REF -> main"
+          git -C .hermes-src diff FETCH_HEAD..HEAD -- agent/memory_provider.py || true
+
+      - name: Run contract guard against upstream main
+        id: guard
+        env:
+          ASTRAL_CONTRACT_REQUIRE: "1"
+          PYTHONPATH: .hermes-src
+        run: pytest tests/ -v --tb=short
+
+      - name: Open or update drift issue
+        if: failure() && github.event_name == 'schedule'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const sha = "${{ steps.head.outputs.sha }}";
+            const date = "${{ steps.head.outputs.date }}";
+            const pin = process.env.HERMES_PINNED_REF;
+            const run = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const title = "Hermes MemoryProvider contract drift detected";
+
+            const body = [
+              `The nightly canary failed against \`${{ env.HERMES_REPO }}@main\` (\`${sha}\`, ${date}).`,
+              ``,
+              `Our pin is \`${pin}\`. Users tracking Hermes \`main\` are likely already`,
+              `affected. Because MemoryManager swallows provider exceptions`,
+              `(DEBUG for \`prefetch\`, WARNING for \`sync_turn\`), the failure mode is`,
+              `**silent**: memory stops working, no traceback, no user-visible error.`,
+              ``,
+              `**Run:** ${run}`,
+              ``,
+              `- [ ] Diff \`agent/memory_provider.py\` and \`agent/memory_manager.py\``,
+              `- [ ] Update \`astral-memory/__init__.py\` overrides`,
+              `- [ ] Extend \`_CONTRACT\` in the plugin and \`_OVERRIDES\` in the test`,
+              `- [ ] Bump \`HERMES_PINNED_REF\` once green`,
+              `- [ ] Cut a release — do not wait for a bug report`,
+            ].join("\n");
+
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: "open",
+              labels: "hermes-drift",
+            });
+
+            if (existing.data.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.data[0].number,
+                body: `Still failing as of \`${sha}\` (${date}). ${run}`,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+                labels: ["hermes-drift", "bug"],
+              });
+            }
+
+  # ---------------------------------------------------------------------------
+  package:
+    name: Package (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Build wheel and sdist
+        run: |
+          pip install build
+          python -m build
+
+      - name: Install the wheel into a clean venv
+        # NOTE: as of 2026-07 this fails. pyproject.toml declares
+        #   [project.scripts] astral-rerank-server = "rerank_server:main"
+        #   [tool.setuptools.py-modules] rerank_server = "rerank_server"
+        # but rerank_server.py is not in the repository. Either vendor the
+        # file or drop both stanzas. Do not paper over this with
+        # `continue-on-error` — a package that cannot be installed is not a
+        # package, and `pip install astral-memory-hermes` is in the README.
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install dist/*.whl
+
+      - name: Import the installed package
+        # The package imports `agent.memory_provider` at module scope by design
+        # (v2.2.0 removed the fallback stub). Outside Hermes that is an
+        # ImportError, and it must be a clear one.
+        run: |
+          set +e
+          .venv/bin/python -c "import astral_memory" 2>err.txt
+          rc=$?
+          set -e
+          if [ $rc -eq 0 ]; then
+            echo "Imported cleanly (unexpected outside Hermes, but fine)."
+            exit 0
+          fi
+          if grep -q "agent.memory_provider" err.txt; then
+            echo "Expected ImportError for agent.memory_provider outside Hermes:"
+            cat err.txt
+            exit 0
+          fi
+          echo "::error::astral_memory failed to import for an unexpected reason"
+          cat err.txt
+          exit 1
+
+      - name: Upload distributions
+        if: matrix.python == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          retention-days: 14

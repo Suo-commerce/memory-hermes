@@ -1,24 +1,113 @@
-# Generation Timestamp: 2026-05-21T10:20:00Z
+# Generation Timestamp: 2026-07-09T00:00:00Z
+#
+# astral-memory/plugin.yaml
 # Astral Core Memory — Hermes Memory Provider Plugin Manifest
 #
-# Source:   astral-memory/plugin.yaml (this repo)
-# Install:  plugins/memory/astral_memory/plugin.yaml (inside hermes-agent/)
+# v2.2.0 CHANGES:
+#   NEW  — `kind: exclusive`. Without it, hermes_cli/plugins.py:1555 falls back
+#          to a heuristic: it reads the FIRST 8192 BYTES of __init__.py looking
+#          for the string "MemoryProvider" or "register_memory_provider". Today
+#          our first match is at byte 798, so the scan succeeds with ~7.4KB of
+#          margin — this is not urgent. But it means recognition depends on how
+#          long the file header happens to be, which is not a property anyone
+#          would think to preserve while editing a comment block. Declaring
+#          kind explicitly skips the scan entirely. (Valid kinds: standalone,
+#          backend, exclusive, platform, model-provider.)
+#   NEW  — `pip_dependencies`. Read by hermes_cli/memory_setup.py:99 and
+#          installed during `hermes memory setup`. We import `requests` and
+#          previously declared it nowhere, relying on Hermes happening to
+#          bundle it.
+#   FIX  — version 2.1.0 -> 2.2.0.
+#   FIX  — description no longer claims a bundled reranker sidecar; the
+#          cross-encoder runs server-side, and rerank_server.py is not
+#          currently shipped in this repository.
 #
-# Activate: hermes config set memory.provider astral_memory
+# WHICH KEYS ACTUALLY DO ANYTHING (verified against Hermes v2026.7.1)
 #
-# NOTE: The directory name must be astral_memory (underscore) when
-# installed into Hermes. Hermes matches memory.provider against the
-# directory name, not this manifest's name field.
+#   Read by plugins/memory/__init__.py (the memory discovery path):
+#       description        — shown in `hermes memory list`
+#     ...and nothing else. The provider NAME comes from the directory name,
+#     not from `name` below.
+#
+#   Read by hermes_cli/plugins.py (the general PluginManager, which handles
+#   user-installed plugins under $HERMES_HOME/plugins/):
+#       name, version, description, author, kind,
+#       requires_env, provides_tools, provides_hooks
+#
+#   Read by hermes_cli/memory_setup.py:
+#       pip_dependencies
+#
+#   `hooks:` is documented in Hermes's own developer guide
+#   (website/docs/developer-guide/memory-provider-plugin.md) but no code reads
+#   it — the manager reads `provides_hooks`. It is kept below because the
+#   upstream docs show it and it costs nothing; `provides_hooks` carries the
+#   same list in the form the loader actually parses.
+#
+#   `homepage:` is read by nothing. Kept for humans.
+#
+# INSTALL
+#   Source:   astral-memory/plugin.yaml  (this repo, hyphen)
+#   Install:  plugins/memory/astral_memory/plugin.yaml  (inside hermes-agent)
+#
+#   The installed directory MUST be `astral_memory` (underscore). Hermes
+#   resolves `memory.provider` against the DIRECTORY name and uses it as the
+#   Python import path; hyphens are not importable. The `name` field below
+#   does not participate in that lookup.
+#
+# ACTIVATE
+#   hermes config set memory.provider astral_memory
 
 name: astral-memory
-version: 2.1.0
+version: 2.2.0
+
+# See header: skips the 8192-byte source scan for user-installed plugins.
+kind: exclusive
+
 description: >
   Offline-first persistent memory with surprise-gated learning, local
   embeddings, cross-encoder reranking, HyDE query expansion, session
-  diary, and fleet sync.  No API keys required.
-  The only Hermes memory provider that works completely offline.
+  diary, and fleet sync. No API keys required. The only Hermes memory
+  provider that works completely offline.
+
 author: Suocommerce
 homepage: https://github.com/Suo-commerce/memory-hermes
-hooks:
+
+# Installed by `hermes memory setup`. The plugin is a thin HTTP bridge —
+# everything heavier (embeddings, reranking, the MASK/HOPE pipeline) lives in
+# the astral-memory-server binary, not in this dependency list.
+pip_dependencies:
+  - requests>=2.25.0
+
+# No environment variables are required. ASTRAL_SERVER_URL and ASTRAL_DATA_DIR
+# are optional overrides; declaring them here would gate availability on their
+# presence.
+requires_env: []
+
+provides_tools:
+  - astral_recall
+  - astral_store
+  - astral_forget
+  - astral_briefing
+  - astral_diary
+  - astral_stats
+  - astral_sync
+
+# The MemoryProvider lifecycle methods this plugin implements beyond the
+# required set. `provides_hooks` is the key the loader parses.
+provides_hooks:
+  - on_turn_start
   - on_session_end
+  - on_session_switch
   - on_pre_compress
+  - on_delegation
+  - on_memory_write
+
+# Documented in Hermes's developer guide, read by no code path. Mirrors
+# provides_hooks above.
+hooks:
+  - on_turn_start
+  - on_session_end
+  - on_session_switch
+  - on_pre_compress
+  - on_delegation
+  - on_memory_write
