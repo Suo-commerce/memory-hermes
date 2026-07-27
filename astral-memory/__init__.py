@@ -1,6 +1,29 @@
-# Generation Timestamp: 2026-07-09T00:00:00Z
+# Generation Timestamp: 2026-07-27T07:00:00Z
 #
 # astral-memory/__init__.py
+# v2.3.0 CHANGES (noise pre-filter + delegation provenance):
+#   NEW — sync_turn() pre-filter: turns whose combined content is under 8
+#     words are not ingested. "Thanks!" / "You're welcome" / short bash
+#     acknowledgements carry nothing extractable; auto-capturing them was
+#     the plugin-side contributor to corpus noise (production finding
+#     RC-3 adjacent — the server's surprise gate catches most, but junk
+#     input also feeds Dreamer episode generation downstream).
+#   NEW — _recalled_ids: per-session tracking of which memory IDs the
+#     server injected via /v1/memory/augmented-prompt. Requires server
+#     >= v2.12.x with `memory_ids` in AugmentedPromptResponse; degrades
+#     to a no-op on older servers (field absent -> empty list).
+#   NEW — on_delegation() now attaches the parent session's recalled
+#     memory IDs as `context_manifest` provenance metadata on the
+#     delegation-result ingest. The sub-agent still runs with
+#     skip_memory=True (Hermes architecture — no pre-delegation hook
+#     exists), so this is retrospective linkage, not live handoff: the
+#     consolidated result enters the corpus already tied to the parent
+#     context that produced it. Live handoff needs an upstream Hermes
+#     `on_before_delegation` hook; tracked in SPEC-AGENT-HOOKS-001 v1.5
+#     §8.4.
+#   Session hygiene — _recalled_ids follows the same lifecycle as
+#     _prefetch_cache (cleared on reset, dropped across id boundaries).
+#
 # v2.2.0 CHANGES (contract repair for Hermes Agent >= v2026.7.1 / v0.18.0):
 #   BREAKING FIX — prefetch()/queue_prefetch()/sync_turn() now accept the
 #     keyword-only `session_id` argument that MemoryManager passes on every
@@ -37,7 +60,7 @@
 #   REMOVED — nothing. tools.py deletion is a separate change.
 """
 Astral Core Memory — Hermes Agent Memory Provider Plugin
-Version: 2.2.0
+Version: 2.3.0
 
 Offline-first persistent memory with surprise-gated learning.
 Implements the MemoryProvider ABC for proper Hermes integration.
@@ -90,7 +113,7 @@ logger = logging.getLogger("astral-memory")
 # Constants
 # ---------------------------------------------------------------------------
 
-_VERSION = "2.2.0"
+_VERSION = "2.3.0"
 _DEFAULT_SERVER_URL = "http://localhost:8090"
 _DEFAULT_DATA_DIR = "~/.astral"
 
@@ -258,6 +281,12 @@ class AstralCoreMemoryProvider(MemoryProvider):
         # Turn counters, keyed by session_id.
         self._turn_counts: Dict[str, int] = {}
 
+        # Memory IDs injected into context this session, keyed by
+        # session_id. Populated from `memory_ids` in the augmented-prompt
+        # response (server >= v2.12.x); empty on older servers. Used as
+        # context_manifest provenance on delegation-result ingests.
+        self._recalled_ids: Dict[str, List[str]] = {}
+
         self._pool: Optional[ThreadPoolExecutor] = None
         self._shutting_down = False
 
@@ -295,6 +324,7 @@ class AstralCoreMemoryProvider(MemoryProvider):
             self._active_session_id = session_id
             self._prefetch_cache.clear()
             self._turn_counts.clear()
+            self._recalled_ids.clear()
 
         self._pool = ThreadPoolExecutor(
             max_workers=_MAX_WORKERS,
@@ -557,6 +587,16 @@ class AstralCoreMemoryProvider(MemoryProvider):
 
         block = str(data.get("context_block", "") or "")
 
+        # Track which memories the server injected (server >= v2.12.x
+        # returns `memory_ids`; older servers omit it — treat as empty,
+        # never let provenance tracking break recall).
+        ids = data.get("memory_ids")
+        if isinstance(ids, list):
+            with self._state_lock:
+                self._recalled_ids[session_id] = [
+                    str(i) for i in ids if i
+                ][:32]
+
         # Optional: prepend the briefing card on the first recall of a session.
         if self._briefing_on_start:
             with self._state_lock:
@@ -584,6 +624,15 @@ class AstralCoreMemoryProvider(MemoryProvider):
     ) -> None:
         """Persist a completed turn. Must be non-blocking."""
         if not self._auto_capture or not self._ready():
+            return
+
+        # v2.3.0 pre-filter: skip low-information turns. Under 8 combined
+        # words there is nothing for the extraction pipeline to keep, and
+        # ingesting them feeds noise into Dreamer episode generation even
+        # when the surprise gate rejects the memory itself.
+        combined = f"{user_content} {assistant_content}"
+        if len(combined.split()) < 8:
+            logger.debug("sync_turn: skipped low-information turn (<8 words)")
             return
 
         sid = self._sid(session_id)
@@ -637,11 +686,14 @@ class AstralCoreMemoryProvider(MemoryProvider):
                 # Genuinely new conversation — drop everything.
                 self._prefetch_cache.clear()
                 self._turn_counts.clear()
+                self._recalled_ids.clear()
             else:
                 # Continuation: carry the turn count forward, but never carry
                 # recalled context across an id boundary.
                 self._prefetch_cache.pop(old, None)
                 self._prefetch_cache.pop(new_session_id, None)
+                self._recalled_ids.pop(old, None)
+                self._recalled_ids.pop(new_session_id, None)
                 if old and old in self._turn_counts:
                     self._turn_counts[new_session_id] = self._turn_counts.pop(old)
 
@@ -741,12 +793,26 @@ class AstralCoreMemoryProvider(MemoryProvider):
 
         sid = self._sid(kwargs.get("session_id", ""))
 
+        # v2.3.0: attach the parent's recalled memory IDs as provenance.
+        # The sub-agent ran with skip_memory=True and never saw these; the
+        # manifest records which parent context *surrounded* the delegation
+        # so the consolidated result is linked to it in the corpus.
+        with self._state_lock:
+            manifest = list(self._recalled_ids.get(sid, ()))
+
         def _ingest() -> None:
-            self._http.post("/v1/memory/ingest", {
+            payload: Dict[str, Any] = {
                 "user_message": task[:self._capture_max_chars],
                 "assistant_response": result[:self._capture_max_chars],
                 "source": f"hermes_delegation_{child_session_id or sid}",
-            })
+            }
+            if manifest:
+                payload["metadata"] = {
+                    "delegation": True,
+                    "context_manifest": manifest,
+                    "child_session_id": child_session_id or None,
+                }
+            self._http.post("/v1/memory/ingest", payload)
 
         self._submit(_ingest)
 
