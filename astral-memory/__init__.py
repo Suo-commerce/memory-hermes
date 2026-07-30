@@ -1,6 +1,17 @@
-# Generation Timestamp: 2026-07-27T07:00:00Z
+# Generation Timestamp: 2026-07-30T01:00:00Z
 #
 # astral-memory/__init__.py
+# v2.3.1 CHANGES (SPEC-HERMES-TUNING-001 T3 — circuit breaker fix):
+#   FIX — requests.Timeout now calls _record_success() instead of
+#     _record_failure(). A timeout means the server accepted the connection
+#     and is processing — it's alive but slow (e.g., D8 reembed saturating
+#     LanceDB I/O). This matches the existing HTTPError treatment (line 195:
+#     "Server is alive — it just said no. Don't trip the breaker."). Before
+#     this fix: 3 × 10s timeouts during D8 → CB opens 60s → retries → 3
+#     more timeouts → opens again, cycling for the entire D8 duration
+#     (potentially hours). Writes silently dropped the whole time.
+#     ConnectionError still trips the CB (server actually unreachable).
+#
 # v2.3.0 CHANGES (noise pre-filter + delegation provenance):
 #   NEW — sync_turn() pre-filter: turns whose combined content is under 8
 #     words are not ingested. "Thanks!" / "You're welcome" / short bash
@@ -60,7 +71,7 @@
 #   REMOVED — nothing. tools.py deletion is a separate change.
 """
 Astral Core Memory — Hermes Agent Memory Provider Plugin
-Version: 2.3.0
+Version: 2.3.1
 
 Offline-first persistent memory with surprise-gated learning.
 Implements the MemoryProvider ABC for proper Hermes integration.
@@ -113,7 +124,7 @@ logger = logging.getLogger("astral-memory")
 # Constants
 # ---------------------------------------------------------------------------
 
-_VERSION = "2.3.0"
+_VERSION = "2.3.1"
 _DEFAULT_SERVER_URL = "http://localhost:8090"
 _DEFAULT_DATA_DIR = "~/.astral"
 
@@ -189,7 +200,9 @@ class _HttpClient:
             self._record_failure()
             return {"error": f"Memory server not reachable at {self.base_url}"}
         except requests.Timeout:
-            self._record_failure()
+            # Server is alive — it accepted the connection, just slow
+            # (e.g., D8 reembed saturating I/O). Don't trip the breaker.
+            self._record_success()
             return {"error": f"Request timed out ({timeout}s)"}
         except requests.HTTPError as e:
             # Server is alive — it just said no. Don't trip the breaker.
