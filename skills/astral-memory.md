@@ -1,10 +1,11 @@
-# Generation Timestamp: 2026-04-28T16:15:00Z
+# Generation Timestamp: 2026-07-30T20:00:00Z
 ---
 name: astral-memory
-version: 2.0.0
+version: 2.4.0
 description: >
   When and how to use Astral Core persistent memory tools.
-  Covers recall, storage, diary, and the "know before speaking" protocol.
+  Covers recall, storage, diary, namespace management, and the
+  "know before speaking" protocol.
 ---
 
 # Astral Core Memory — Agent Skill
@@ -127,6 +128,20 @@ Use when the user asks to sync across devices:
 
 Only works when Orbital Fortress is configured.
 
+### `astral_namespace` — Memory Namespace
+Use when the user switches context or mentions a project/topic:
+- "Let's work on Tree Guardians now" → `astral_namespace(action="set", namespace="tree-guardians")`
+- "What namespace are we in?" → `astral_namespace(action="get")`
+- "Search all projects" → `astral_recall(query="...", namespace="all")`
+- "Switch back to general" → `astral_namespace(action="clear")`
+
+A namespace partitions memories by context — a project, a topic, a game
+world. When active, all memory operations (auto-capture, auto-recall,
+explicit store/recall) are scoped to that namespace. When cleared, all
+namespaces are searched (cross-namespace mode).
+
+The namespace resets to the config default when the session changes.
+
 ## Patterns to Follow
 
 1. **Recall before responding** about anything personal or project-specific
@@ -138,3 +153,5 @@ Only works when Orbital Fortress is configured.
 7. **Use astral_briefing** when you need a fuller picture
 8. **Confirm before forgetting** — deletion is permanent
 9. **Don't duplicate built-in memory writes** — MEMORY.md content is mirrored automatically
+10. **Set the namespace** when switching projects — `astral_namespace(action="set", ...)` scopes all memory to that context
+11. **Use "all" to search cross-namespace** — `astral_recall(query="...", namespace="all")` ignores the active namespace

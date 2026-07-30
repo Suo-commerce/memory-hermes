@@ -1,5 +1,14 @@
-<!-- Generation Timestamp: 2026-07-09T00:00:00Z -->
+<!-- Generation Timestamp: 2026-07-30T20:00:00Z -->
 <!--
+  v2.4.0 CHANGES:
+    NEW  — Namespace support (SPEC-NAMESPACE-001). Memories are partitioned
+           by context (project, topic, game world) via a slug string. New
+           `astral_namespace` tool, `default_namespace` config key, and
+           `namespace` parameter on `astral_recall` / `astral_store`.
+    NEW  — `astral_namespace` in the tools table.
+    NEW  — `default_namespace` in the config table.
+    NEW  — v2.4.0 entry in What's New.
+
   v2.2.0 CHANGES:
     NEW  — Compatibility matrix. The absence of one is why the v2.1.0 outage
            was invisible: nothing told a user their plugin and their Hermes
@@ -40,7 +49,7 @@ not interchangeable across that boundary.
 
 | Hermes Agent | Plugin version | Status |
 |---|---|---|
-| `>= v2026.7.1` (v0.18.0) | **2.2.0** | Supported |
+| `>= v2026.7.1` (v0.18.0) | **2.4.0** | Supported |
 | `v0.17.x` and earlier | 2.1.0 | End of life — no further fixes |
 | Any | 2.1.0 on Hermes ≥ v0.18.0 | **Broken. Memory silently does nothing.** |
 
@@ -48,7 +57,7 @@ Check your versions:
 
 ```bash
 hermes --version
-hermes plugins   # look for: astral-memory v2.2.0
+hermes plugins   # look for: astral-memory v2.4.0
 ```
 
 ### If you are on plugin 2.1.0 with Hermes v0.18.0 or newer
@@ -176,7 +185,7 @@ Then, inside the agent:
 /plugins
 ```
 
-You should see `astral-memory v2.2.0`. Confirm it can reach the server:
+You should see `astral-memory v2.4.0`. Confirm it can reach the server:
 
 ```
 use astral_stats to show memory statistics
@@ -189,6 +198,34 @@ Troubleshooting.
 ---
 
 ## What's New
+
+### v2.4.0 — namespace support
+
+- **Memory namespaces.** Memories are partitioned by context — a project,
+  a topic, a game world — via a namespace slug string. The server stores
+  and filters on it; the plugin tracks which namespace is active per
+  session.
+- **New `astral_namespace` tool.** Set, query, or clear the active
+  namespace mid-conversation: `astral_namespace(action="set",
+  namespace="tree-guardians")`.
+- **Per-call namespace override.** `astral_recall` and `astral_store`
+  accept a `namespace` parameter. Pass `"all"` on recall to search across
+  all namespaces.
+- **`default_namespace` config key.** Set a device-wide default in
+  `astral-memory.json`. Empty or absent = cross-namespace (search all,
+  write to server default).
+- **Backward compatible.** If the server doesn't support namespace (pre-
+  NAMESPACE-001), the plugin feature-detects at startup and silently
+  omits all namespace params. Old servers keep working.
+
+### v2.3.x — internal fixes
+
+- **Noise pre-filter.** Turns under 8 combined words are not ingested —
+  "Thanks!" / "You're welcome" carry nothing extractable.
+- **Delegation provenance.** Parent recalled memory IDs are attached as
+  `context_manifest` metadata on delegation-result ingests.
+- **Circuit breaker fix.** `requests.Timeout` no longer trips the breaker
+  — a timeout means the server is alive but slow, not unreachable.
 
 ### v2.2.0 — contract repair
 
@@ -285,6 +322,7 @@ diary tells it what happened and where you left off.
 | `astral_diary` | Write or read session diary entries |
 | `astral_stats` | Memory system statistics and health |
 | `astral_sync` | Sync with Orbital Fortress (when configured) |
+| `astral_namespace` | Set, query, or clear the active memory namespace |
 
 Auto-recall and auto-capture run without the agent invoking anything. The
 tools are for when it needs to reach for memory deliberately.
@@ -314,7 +352,8 @@ prompts.
   "max_recall_memories": 5,
   "capture_max_chars": 8000,
   "briefing_on_start": false,
-  "min_similarity": null
+  "min_similarity": null,
+  "default_namespace": ""
 }
 ```
 
@@ -328,6 +367,7 @@ prompts.
 | `capture_max_chars` | `8000` | Truncation limit per message |
 | `briefing_on_start` | `false` | Prepend the briefing card on a session's first turn |
 | `min_similarity` | unset | Floor for recall; unset defers to the server |
+| `default_namespace` | `""` | Default memory namespace for this device. Empty = cross-namespace (search all, write to server default). Lowercase alphanumeric + hyphens, max 64 chars. |
 
 ### Memory server flags
 

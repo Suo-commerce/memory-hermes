@@ -1,7 +1,13 @@
-# Generation Timestamp: 2026-07-09T00:00:00Z
+# Generation Timestamp: 2026-07-30T20:00:00Z
 #
 # astral-memory/plugin.yaml
 # Astral Core Memory — Hermes Memory Provider Plugin Manifest
+#
+# v2.4.0 CHANGES (SPEC-NAMESPACE-001):
+#   NEW  — `astral_namespace` added to provides_tools/hooks. The agent can
+#          now set, query, or clear the active memory namespace for a
+#          session, partitioning memories by project/topic context.
+#   FIX  — version 2.3.1 -> 2.4.0.
 #
 # v2.2.0 CHANGES:
 #   NEW  — `kind: exclusive`. Without it, hermes_cli/plugins.py:1555 falls back
@@ -58,7 +64,7 @@
 #   hermes config set memory.provider astral_memory
 
 name: astral-memory
-version: 2.2.0
+version: 2.4.0
 
 # See header: skips the 8192-byte source scan for user-installed plugins.
 kind: exclusive
@@ -91,6 +97,7 @@ provides_tools:
   - astral_diary
   - astral_stats
   - astral_sync
+  - astral_namespace
 
 # The MemoryProvider lifecycle methods this plugin implements beyond the
 # required set. `provides_hooks` is the key the loader parses.

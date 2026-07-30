@@ -1,6 +1,34 @@
-# Generation Timestamp: 2026-07-30T01:00:00Z
+# Generation Timestamp: 2026-07-30T20:00:00Z
 #
 # astral-memory/__init__.py
+# v2.4.0 CHANGES (SPEC-NAMESPACE-001 v1.0 — Memory Namespace Architecture):
+#   NEW  — Namespace support. Memories are partitioned by context (project,
+#          topic, game world) via a slug string. The server stores and filters
+#          on it; the plugin tracks which namespace is active for a session.
+#          §7-§15 of the consolidated spec.
+#   NEW  — `default_namespace` config key in astral-memory.json. Empty or
+#          absent → cross-namespace mode (all namespaces searched, writes go
+#          to server default "default"). Non-empty → sent as `namespace` on
+#          writes and `namespace_filter` on reads, unless overridden per-call.
+#   NEW  — `_active_namespace` / `_config_namespace` state fields with
+#          `_resolve_namespace()` resolution method (§7.2, §9.1).
+#   NEW  — `astral_namespace` tool: set / get / clear the active namespace
+#          for the current session (§12). Registered in both dispatch and
+#          get_tool_schemas() so the LLM can discover and invoke it.
+#   NEW  — `namespace` parameter on `astral_recall` and `astral_store` for
+#          per-call overrides (§13). `astral_recall` with namespace="all"
+#          forces cross-namespace search.
+#   NEW  — Feature detection: `self._server_supports_namespace` probed at
+#          startup via the /health endpoint. When False, all namespace params
+#          are silently omitted (§14.1). Old servers keep working.
+#   NEW  — Namespace injected into all write paths: sync_turn, _tool_store,
+#          on_pre_compress, on_delegation, on_memory_write (§10).
+#   NEW  — namespace_filter injected into all read paths: _do_prefetch,
+#          _tool_recall (§11). Briefings stay cross-namespace by design.
+#   NEW  — `_active_namespace` reset to `_config_namespace` on session switch
+#          (§9.2). Subagents inherit the parent's namespace via on_delegation
+#          (§9.3).
+#
 # v2.3.1 CHANGES (SPEC-HERMES-TUNING-001 T3 — circuit breaker fix):
 #   FIX — requests.Timeout now calls _record_success() instead of
 #     _record_failure(). A timeout means the server accepted the connection
@@ -71,7 +99,7 @@
 #   REMOVED — nothing. tools.py deletion is a separate change.
 """
 Astral Core Memory — Hermes Agent Memory Provider Plugin
-Version: 2.3.1
+Version: 2.4.0
 
 Offline-first persistent memory with surprise-gated learning.
 Implements the MemoryProvider ABC for proper Hermes integration.
@@ -92,6 +120,14 @@ Architecture:
   Delta Rule matrix, 5-tier lifecycle, hybrid retrieval (HyDE +
   cross-encoder reranking + session expansion), Dreamer consolidation.
   This plugin just talks to it.
+
+Namespace (SPEC-NAMESPACE-001):
+  Memories are partitioned by context via a namespace slug. The plugin
+  tracks the active namespace per session; the server stores and filters
+  on the string. Set via the `astral_namespace` tool, the
+  `default_namespace` config key, or per-call on `astral_recall` /
+  `astral_store`. When no namespace is active, all namespaces are
+  searched (cross-namespace mode).
 
 Repository: https://github.com/Suo-commerce/memory-hermes
 License: MIT
@@ -124,7 +160,7 @@ logger = logging.getLogger("astral-memory")
 # Constants
 # ---------------------------------------------------------------------------
 
-_VERSION = "2.3.1"
+_VERSION = "2.4.0"
 _DEFAULT_SERVER_URL = "http://localhost:8090"
 _DEFAULT_DATA_DIR = "~/.astral"
 
@@ -141,6 +177,9 @@ _MAX_WORKERS = 2
 
 # Consolidation nudge cadence (turns). 0 disables.
 _CONSOLIDATE_EVERY_N_TURNS = 50
+
+# Namespace validation (SPEC-NAMESPACE-001 §3.2, §8.2)
+_NS_MAX_LEN = 64
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +303,31 @@ def _default_hermes_home() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Namespace validation (SPEC-NAMESPACE-001 §8.2)
+# ---------------------------------------------------------------------------
+
+def _validate_namespace(ns: str) -> Optional[str]:
+    """Return an error message if the namespace is invalid, None if valid.
+
+    Rules (§3.2): lowercase alphanumeric + hyphens only, 1-64 chars,
+    must not start or end with a hyphen. The token "all" is accepted
+    as a special value meaning cross-namespace search.
+    """
+    if not ns or len(ns) > _NS_MAX_LEN:
+        return f"namespace must be 1-{_NS_MAX_LEN} characters"
+    if ns == "all":
+        return None  # special token, valid
+    if not all(
+        c.isascii() and (c.islower() or c.isdigit() or c == '-')
+        for c in ns
+    ):
+        return "namespace must be lowercase alphanumeric with hyphens only"
+    if ns.startswith('-') or ns.endswith('-'):
+        return "namespace must not start or end with hyphen"
+    return None
+
+
+# ---------------------------------------------------------------------------
 # MemoryProvider implementation
 # ---------------------------------------------------------------------------
 
@@ -299,6 +363,17 @@ class AstralCoreMemoryProvider(MemoryProvider):
         # response (server >= v2.12.x); empty on older servers. Used as
         # context_manifest provenance on delegation-result ingests.
         self._recalled_ids: Dict[str, List[str]] = {}
+
+        # Namespace state (SPEC-NAMESPACE-001 §9.1).
+        # _config_namespace is loaded from `default_namespace` in config.
+        # _active_namespace is set per-session via the astral_namespace tool
+        # and reset to _config_namespace on session switch.
+        self._active_namespace: str = ""
+        self._config_namespace: str = ""
+
+        # Feature flag: probed at startup via /health. When False, all
+        # namespace params are silently omitted (§14.1).
+        self._server_supports_namespace: bool = False
 
         self._pool: Optional[ThreadPoolExecutor] = None
         self._shutting_down = False
@@ -338,6 +413,8 @@ class AstralCoreMemoryProvider(MemoryProvider):
             self._prefetch_cache.clear()
             self._turn_counts.clear()
             self._recalled_ids.clear()
+            # §9.2: reset active namespace to config default on session start.
+            self._active_namespace = self._config_namespace
 
         self._pool = ThreadPoolExecutor(
             max_workers=_MAX_WORKERS,
@@ -348,9 +425,21 @@ class AstralCoreMemoryProvider(MemoryProvider):
         health = self._http.health()
         if health:
             self._server_healthy = True
+            # §14.1: feature-detect namespace support. The updated server
+            # reports `namespace_enabled` in its /health response. Old
+            # servers omit it — namespace params are silently skipped.
+            self._server_supports_namespace = bool(
+                health.get("namespace_enabled", False)
+            )
+            if self._config_namespace and not self._server_supports_namespace:
+                logger.debug(
+                    "Server doesn't support namespace, skipping "
+                    "(config default_namespace='%s' ignored)",
+                    self._config_namespace,
+                )
             logger.info(
                 "Astral Core Memory v%s: %s (server v%s) — %d memories, "
-                "embedding=%s, rerank=%s, hyde=%s",
+                "embedding=%s, rerank=%s, hyde=%s, namespace=%s",
                 _VERSION,
                 health.get("status", "?"),
                 health.get("version", "?"),
@@ -358,9 +447,11 @@ class AstralCoreMemoryProvider(MemoryProvider):
                 health.get("embedding_backend", "?"),
                 "on" if health.get("deep_rerank_enabled") else "off",
                 "on" if health.get("hyde_enabled") else "off",
+                "on" if self._server_supports_namespace else "off",
             )
         else:
             self._server_healthy = False
+            self._server_supports_namespace = False
             logger.warning(
                 "Astral Core memory server not reachable at %s. "
                 "Memory is INACTIVE for this session. Start the services:\n"
@@ -391,6 +482,23 @@ class AstralCoreMemoryProvider(MemoryProvider):
                 self._min_similarity = None
         self._data_dir = cfg.get("data_dir", self._data_dir)
 
+        # §8.1: load default_namespace. Empty string or absent →
+        # cross-namespace mode (no namespace sent on writes/reads).
+        raw_ns = cfg.get("default_namespace", "")
+        if raw_ns and isinstance(raw_ns, str):
+            err = _validate_namespace(raw_ns)
+            if err:
+                # §8.2: invalid config namespace is logged at WARNING
+                # and treated as empty. The plugin does not crash.
+                logger.warning(
+                    "Invalid default_namespace: %s — ignoring", raw_ns,
+                )
+                self._config_namespace = ""
+            else:
+                self._config_namespace = raw_ns
+        else:
+            self._config_namespace = ""
+
         env_url = os.environ.get("ASTRAL_SERVER_URL")
         if env_url:
             self._server_url = env_url
@@ -419,6 +527,23 @@ class AstralCoreMemoryProvider(MemoryProvider):
     def _ready(self) -> bool:
         return self._http is not None
 
+    def _resolve_namespace(self) -> str:
+        """Return the active namespace, or empty string for cross-namespace.
+
+        Resolution order (§7.2):
+          1. Session-level override (_active_namespace, set via astral_namespace)
+          2. Config default (_config_namespace, from default_namespace)
+          3. Empty (no namespace sent — server defaults on write, searches
+             all on read)
+
+        When the server does not support namespace (§14.1), returns empty
+        string so all namespace params are silently omitted.
+        """
+        if not self._server_supports_namespace:
+            return ""
+        with self._state_lock:
+            return self._active_namespace or self._config_namespace
+
     # ------------------------------------------------------------------
     # Tools
     # ------------------------------------------------------------------
@@ -432,6 +557,7 @@ class AstralCoreMemoryProvider(MemoryProvider):
             schemas.ASTRAL_DIARY,
             schemas.ASTRAL_STATS,
             schemas.ASTRAL_SYNC,
+            schemas.ASTRAL_NAMESPACE,
         ]
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any],
@@ -454,6 +580,7 @@ class AstralCoreMemoryProvider(MemoryProvider):
             "astral_diary":    self._tool_diary,
             "astral_stats":    self._tool_stats,
             "astral_sync":     self._tool_sync,
+            "astral_namespace": self._tool_namespace,
         }
 
         handler = dispatch.get(tool_name)
@@ -467,12 +594,25 @@ class AstralCoreMemoryProvider(MemoryProvider):
             return json.dumps({"error": str(e)})
 
     def _tool_recall(self, args: dict, session_id: str) -> str:
-        payload = {
+        payload: Dict[str, Any] = {
             "query": args.get("query", ""),
             "limit": args.get("limit", self._max_recall),
         }
         if self._min_similarity is not None:
             payload["min_similarity"] = self._min_similarity
+
+        # §11.2: per-call namespace override.
+        # "all" is a special token forcing cross-namespace search.
+        ns_arg = args.get("namespace", "")
+        if ns_arg == "all":
+            pass  # cross-namespace — don't send namespace_filter
+        elif ns_arg:
+            payload["namespace_filter"] = ns_arg
+        else:
+            ns = self._resolve_namespace()
+            if ns:
+                payload["namespace_filter"] = ns
+
         return json.dumps(
             self._http.post("/v1/memory/search", payload),
             indent=2, default=str,
@@ -483,13 +623,24 @@ class AstralCoreMemoryProvider(MemoryProvider):
         if not text:
             return json.dumps({"error": "text is required"})
         category = args.get("category", "fact")
+        payload: Dict[str, Any] = {
+            "user_message": text,
+            "assistant_response": f"Stored as {category}.",
+            "source": f"hermes_explicit_{session_id}" if session_id
+                      else "hermes_explicit",
+        }
+
+        # §10.2: per-call namespace override, else resolve from session.
+        ns_arg = args.get("namespace", "")
+        if ns_arg:
+            payload["namespace"] = ns_arg
+        else:
+            ns = self._resolve_namespace()
+            if ns:
+                payload["namespace"] = ns
+
         return json.dumps(
-            self._http.post("/v1/memory/ingest", {
-                "user_message": text,
-                "assistant_response": f"Stored as {category}.",
-                "source": f"hermes_explicit_{session_id}" if session_id
-                          else "hermes_explicit",
-            }),
+            self._http.post("/v1/memory/ingest", payload),
             indent=2, default=str,
         )
 
@@ -535,6 +686,53 @@ class AstralCoreMemoryProvider(MemoryProvider):
     def _tool_sync(self, args: dict, session_id: str) -> str:
         return json.dumps(self._http.post("/v1/sync/trigger"),
                           indent=2, default=str)
+
+    def _tool_namespace(self, args: dict, session_id: str) -> str:
+        """Set, get, or clear the active memory namespace (§12).
+
+        This is the keystone of the namespace feature — without it, the
+        agent has no way to set namespace mid-conversation.
+        """
+        action = args.get("action", "get")
+
+        if action == "get":
+            ns = self._resolve_namespace()
+            return json.dumps({
+                "active_namespace": ns or None,
+                "config_default": self._config_namespace or None,
+                "mode": "namespace" if ns else "cross-namespace",
+                "server_supported": self._server_supports_namespace,
+            }, indent=2)
+
+        if action == "set":
+            ns = args.get("namespace", "").strip()
+            if not ns:
+                return json.dumps(
+                    {"error": "namespace is required for 'set'"}
+                )
+            err = _validate_namespace(ns)
+            if err:
+                return json.dumps({"error": err})
+            with self._state_lock:
+                self._active_namespace = ns
+            logger.info(
+                "Namespace set to '%s' for session %s", ns, session_id,
+            )
+            return json.dumps({
+                "active_namespace": ns,
+                "mode": "namespace",
+            }, indent=2)
+
+        if action == "clear":
+            with self._state_lock:
+                self._active_namespace = ""
+            logger.info("Namespace cleared for session %s", session_id)
+            return json.dumps({
+                "active_namespace": None,
+                "mode": "cross-namespace",
+            }, indent=2)
+
+        return json.dumps({"error": f"Unknown action: {action}"})
 
     # ------------------------------------------------------------------
     # System prompt
@@ -593,6 +791,12 @@ class AstralCoreMemoryProvider(MemoryProvider):
         if self._min_similarity is not None:
             payload["min_similarity"] = self._min_similarity
 
+        # §11.1: auto-recall respects the active namespace.
+        ns = self._resolve_namespace()
+        if ns:
+            payload["namespace_filter"] = ns
+            logger.debug("prefetch: filtering by namespace '%s'", ns)
+
         data = self._http.post("/v1/memory/augmented-prompt", payload)
         if "error" in data:
             logger.debug("Prefetch failed (non-fatal): %s", data["error"])
@@ -650,12 +854,19 @@ class AstralCoreMemoryProvider(MemoryProvider):
 
         sid = self._sid(session_id)
 
+        # §10.1: resolve namespace for auto-capture.
+        ns = self._resolve_namespace()
+
         def _sync() -> None:
-            result = self._http.post("/v1/memory/ingest", {
+            payload: Dict[str, Any] = {
                 "user_message": user_content[:self._capture_max_chars],
                 "assistant_response": assistant_content[:self._capture_max_chars],
                 "source": f"hermes_{sid}" if sid else "hermes",
-            })
+            }
+            if ns:
+                payload["namespace"] = ns
+                logger.debug("sync_turn: writing to namespace '%s'", ns)
+            result = self._http.post("/v1/memory/ingest", payload)
             if "error" in result:
                 logger.debug("sync_turn failed (non-fatal): %s", result["error"])
 
@@ -694,6 +905,15 @@ class AstralCoreMemoryProvider(MemoryProvider):
         with self._state_lock:
             old = self._active_session_id
             self._active_session_id = new_session_id
+
+            # §9.2: reset active namespace to config default on session
+            # switch. Multi-session contexts each get their own namespace
+            # state via session_id keying.
+            self._active_namespace = self._config_namespace
+            logger.debug(
+                "Session changed: namespace reset to '%s'",
+                self._config_namespace or "<none>",
+            )
 
             if reset:
                 # Genuinely new conversation — drop everything.
@@ -746,11 +966,17 @@ class AstralCoreMemoryProvider(MemoryProvider):
 
         batch = pairs[:10]
 
+        # §10.3: pre-compress capture inherits the session-level namespace.
+        ns = self._resolve_namespace()
+
         def _ingest() -> None:
-            result = self._http.post("/v1/memory/ingest/batch", {
+            payload: Dict[str, Any] = {
                 "turns": batch,
                 "source": f"hermes_compress_{sid}" if sid else "hermes_compress",
-            })
+            }
+            if ns:
+                payload["namespace"] = ns
+            result = self._http.post("/v1/memory/ingest/batch", payload)
             if "error" in result:
                 logger.debug("Pre-compress capture failed: %s", result["error"])
             else:
@@ -813,12 +1039,17 @@ class AstralCoreMemoryProvider(MemoryProvider):
         with self._state_lock:
             manifest = list(self._recalled_ids.get(sid, ()))
 
+        # §9.3: subagents inherit the parent's namespace.
+        ns = self._resolve_namespace()
+
         def _ingest() -> None:
             payload: Dict[str, Any] = {
                 "user_message": task[:self._capture_max_chars],
                 "assistant_response": result[:self._capture_max_chars],
                 "source": f"hermes_delegation_{child_session_id or sid}",
             }
+            if ns:
+                payload["namespace"] = ns
             if manifest:
                 payload["metadata"] = {
                     "delegation": True,
@@ -845,8 +1076,11 @@ class AstralCoreMemoryProvider(MemoryProvider):
         meta = dict(metadata or {})
         sid = self._sid(str(meta.get("session_id", "")))
 
+        # Namespace: MEMORY.md/USER.md writes inherit the active namespace.
+        ns = self._resolve_namespace()
+
         def _mirror() -> None:
-            self._http.post("/v1/memory/ingest", {
+            payload: Dict[str, Any] = {
                 "user_message": content[:self._capture_max_chars],
                 "assistant_response": f"Mirrored from Hermes {target} ({action}).",
                 "source": f"hermes_builtin_{target}",
@@ -856,7 +1090,10 @@ class AstralCoreMemoryProvider(MemoryProvider):
                     "write_origin": meta.get("write_origin"),
                     "tool_name": meta.get("tool_name"),
                 },
-            })
+            }
+            if ns:
+                payload["namespace"] = ns
+            self._http.post("/v1/memory/ingest", payload)
 
         self._submit(_mirror)
 
@@ -914,6 +1151,15 @@ class AstralCoreMemoryProvider(MemoryProvider):
                 "default": "false",
                 "choices": ["true", "false"],
             },
+            {
+                "key": "default_namespace",
+                "description": (
+                    "Default memory namespace for this device. Empty = "
+                    "cross-namespace (search all, write to server default). "
+                    "Lowercase alphanumeric + hyphens, max 64 chars."
+                ),
+                "default": "",
+            },
         ]
 
     def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
@@ -931,6 +1177,15 @@ class AstralCoreMemoryProvider(MemoryProvider):
                 coerced["max_recall_memories"] = int(coerced["max_recall_memories"])
             except (TypeError, ValueError):
                 coerced["max_recall_memories"] = 5
+
+        if "default_namespace" in coerced:
+            ns = str(coerced["default_namespace"] or "").strip()
+            if ns:
+                err = _validate_namespace(ns)
+                if err:
+                    logger.warning("Invalid default_namespace in save_config: %s", ns)
+                    ns = ""
+            coerced["default_namespace"] = ns
 
         existing.update(coerced)
         path.parent.mkdir(parents=True, exist_ok=True)

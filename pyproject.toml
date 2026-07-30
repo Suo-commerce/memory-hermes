@@ -1,6 +1,10 @@
-# Generation Timestamp: 2026-07-09T00:00:00Z
+# Generation Timestamp: 2026-07-30T20:00:00Z
 #
 # pyproject.toml
+# v2.4.0 CHANGES (SPEC-NAMESPACE-001):
+#   FIX  — version bumped 2.2.0 -> 2.4.0 to match plugin.yaml and __init__.py.
+#          Namespace support is a significant feature addition.
+#
 # v2.2.0 CHANGES:
 #   FIX — `[tool.setuptools.py-modules]` was declared as a string
 #         (`rerank_server = "rerank_server"`). Setuptools requires an array,
@@ -38,7 +42,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "astral-memory-hermes"
-version = "2.2.0"
+version = "2.4.0"
 description = "Offline-first persistent memory provider for Hermes Agent. Surprise-gated learning, local embeddings, cross-encoder reranking, HyDE query expansion, session diary, fleet sync. No API keys required."
 readme = "README.md"
 license = { text = "MIT" }

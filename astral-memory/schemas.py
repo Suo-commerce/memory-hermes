@@ -1,11 +1,19 @@
-# Generation Timestamp: 2026-04-28T15:55:00Z
+# Generation Timestamp: 2026-07-30T20:00:00Z
 """
 Tool schemas — what the LLM reads to decide when to call Astral Core tools.
-Version: 2.0.0
+Version: 2.4.0
 
 These are returned by AstralCoreMemoryProvider.get_tool_schemas() and
 injected into the Hermes tool registry automatically.  The LLM sees
 them alongside built-in tools.
+
+v2.4.0 CHANGES (SPEC-NAMESPACE-001):
+  NEW  — `namespace` parameter on astral_recall and astral_store.
+         Pass a specific namespace slug to scope the operation, or "all"
+         on recall to search across all namespaces.
+  NEW  — ASTRAL_NAMESPACE schema for the astral_namespace tool, which
+         sets, queries, or clears the active memory namespace for the
+         session.
 """
 
 ASTRAL_RECALL = {
@@ -25,6 +33,14 @@ ASTRAL_RECALL = {
             "limit": {
                 "type": "integer",
                 "description": "Maximum results to return (default: 5)",
+            },
+            "namespace": {
+                "type": "string",
+                "description": (
+                    "Namespace to search within. Omit to use the session's "
+                    "active namespace. Pass \"all\" to search across all "
+                    "namespaces (cross-namespace search)."
+                ),
             },
         },
         "required": ["query"],
@@ -49,6 +65,13 @@ ASTRAL_STORE = {
             "category": {
                 "type": "string",
                 "description": "Category: fact, preference, decision, pattern (default: fact)",
+            },
+            "namespace": {
+                "type": "string",
+                "description": (
+                    "Namespace to store this memory in. Omit to use the "
+                    "session's active namespace."
+                ),
             },
         },
         "required": ["text"],
@@ -146,5 +169,37 @@ ASTRAL_SYNC = {
     "parameters": {
         "type": "object",
         "properties": {},
+    },
+}
+
+ASTRAL_NAMESPACE = {
+    "name": "astral_namespace",
+    "description": (
+        "Set or query the active memory namespace for this session. "
+        "A namespace partitions memories by context (project, topic, "
+        "game world). When set, all memory operations are scoped to "
+        "that namespace. When unset, all namespaces are searched."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["set", "get", "clear"],
+                "description": (
+                    "set — activate a namespace; "
+                    "get — show the current namespace; "
+                    "clear — deactivate (switch to cross-namespace mode)."
+                ),
+            },
+            "namespace": {
+                "type": "string",
+                "description": (
+                    "Namespace slug (lowercase alphanumeric with hyphens). "
+                    "Required for 'set'."
+                ),
+            },
+        },
+        "required": ["action"],
     },
 }

@@ -1,7 +1,7 @@
-# Generation Timestamp: 2026-07-09T00:00:00Z
+# Generation Timestamp: 2026-07-30T20:00:00Z
 #
 # tests/test_provider_contract.py
-# v1.0.0 — CI guard against MemoryProvider contract drift.
+# v1.1.0 — added namespace tests (SPEC-NAMESPACE-001).
 #
 # WHY THIS FILE EXISTS
 #   astral-memory v2.1.0 shipped with `prefetch(self, query)` against a Hermes
@@ -154,7 +154,7 @@ class _FakeHttp:
         return {
             "status": "ok", "version": "test", "total_memories": 0,
             "embedding_backend": "fake", "deep_rerank_enabled": False,
-            "hyde_enabled": False,
+            "hyde_enabled": False, "namespace_enabled": True,
         }
 
     def paths(self, method: Optional[str] = None) -> List[str]:
@@ -374,10 +374,11 @@ def test_every_declared_tool_has_a_handler(provider):
 
 def _minimal_args(name: str) -> Dict[str, Any]:
     return {
-        "astral_recall":  {"query": "q"},
-        "astral_store":   {"text": "t"},
-        "astral_forget":  {"source": "s"},
-        "astral_diary":   {"action": "read"},
+        "astral_recall":    {"query": "q"},
+        "astral_store":     {"text": "t"},
+        "astral_forget":    {"source": "s"},
+        "astral_diary":     {"action": "read"},
+        "astral_namespace": {"action": "get"},
     }.get(name, {})
 
 
@@ -593,7 +594,342 @@ def test_shutdown_is_idempotent(provider):
 
 
 # ---------------------------------------------------------------------------
-# 8. The guard itself
+# 8. Namespace (SPEC-NAMESPACE-001 §7-§15)
+# ---------------------------------------------------------------------------
+
+def test_namespace_tool_is_registered(provider):
+    """The LLM must see astral_namespace in the tool schemas."""
+    names = [s["name"] for s in provider.get_tool_schemas()]
+    assert "astral_namespace" in names
+
+
+def test_namespace_tool_has_handler(provider):
+    """astral_namespace must be in the dispatch table."""
+    out = json.loads(provider.handle_tool_call(
+        "astral_namespace", {"action": "get"},
+    ))
+    assert "error" not in out
+
+
+def test_namespace_get_returns_cross_namespace_by_default(provider):
+    out = json.loads(provider.handle_tool_call(
+        "astral_namespace", {"action": "get"},
+    ))
+    assert out["mode"] == "cross-namespace"
+    assert out["active_namespace"] is None
+    assert out["server_supported"] is True
+
+
+def test_namespace_set_and_get(provider):
+    out = json.loads(provider.handle_tool_call(
+        "astral_namespace", {"action": "set", "namespace": "tree-guardians"},
+    ))
+    assert out["active_namespace"] == "tree-guardians"
+    assert out["mode"] == "namespace"
+
+    out = json.loads(provider.handle_tool_call(
+        "astral_namespace", {"action": "get"},
+    ))
+    assert out["active_namespace"] == "tree-guardians"
+    assert out["mode"] == "namespace"
+
+
+def test_namespace_clear(provider):
+    provider.handle_tool_call(
+        "astral_namespace", {"action": "set", "namespace": "tree-guardians"},
+    )
+    out = json.loads(provider.handle_tool_call(
+        "astral_namespace", {"action": "clear"},
+    ))
+    assert out["active_namespace"] is None
+    assert out["mode"] == "cross-namespace"
+
+
+def test_namespace_set_rejects_invalid_slug(provider):
+    for bad in ("UPPER", "has space", "-leading", "trailing-", "x" * 65, "under_score"):
+        out = json.loads(provider.handle_tool_call(
+            "astral_namespace", {"action": "set", "namespace": bad},
+        ))
+        assert "error" in out, f"'{bad}' should be rejected"
+
+
+def test_namespace_set_accepts_valid_slugs(provider):
+    for good in ("tree-guardians", "astral-core", "sprint-14", "a", "all", "abc123"):
+        out = json.loads(provider.handle_tool_call(
+            "astral_namespace", {"action": "set", "namespace": good},
+        ))
+        assert "error" not in out, f"'{good}' should be accepted"
+
+
+def test_namespace_set_requires_namespace_arg(provider):
+    out = json.loads(provider.handle_tool_call(
+        "astral_namespace", {"action": "set"},
+    ))
+    assert "error" in out
+
+
+def test_namespace_set_empty_string_rejected(provider):
+    out = json.loads(provider.handle_tool_call(
+        "astral_namespace", {"action": "set", "namespace": ""},
+    ))
+    assert "error" in out
+
+
+def test_namespace_unknown_action_returns_error(provider):
+    out = json.loads(provider.handle_tool_call(
+        "astral_namespace", {"action": "frobnicate"},
+    ))
+    assert "error" in out
+
+
+def test_sync_turn_includes_namespace_when_active(provider, http):
+    provider.handle_tool_call(
+        "astral_namespace", {"action": "set", "namespace": "tree-guardians"},
+    )
+    provider.sync_turn("user says something here", "assistant responds at length")
+    _drain(provider)
+    body = http.payload_for("/v1/memory/ingest")
+    assert body["namespace"] == "tree-guardians"
+
+
+def test_sync_turn_omits_namespace_when_inactive(provider, http):
+    provider.sync_turn("user says something here", "assistant responds at length")
+    _drain(provider)
+    body = http.payload_for("/v1/memory/ingest")
+    assert "namespace" not in body
+
+
+def test_prefetch_includes_namespace_filter_when_active(provider, http):
+    provider.handle_tool_call(
+        "astral_namespace", {"action": "set", "namespace": "astral-core"},
+    )
+    provider.prefetch("query text", session_id="session-alpha")
+    body = http.payload_for("/v1/memory/augmented-prompt")
+    assert body["namespace_filter"] == "astral-core"
+
+
+def test_prefetch_omits_namespace_filter_when_inactive(provider, http):
+    provider.prefetch("query text", session_id="session-alpha")
+    body = http.payload_for("/v1/memory/augmented-prompt")
+    assert "namespace_filter" not in body
+
+
+def test_recall_includes_namespace_filter_when_active(provider, http):
+    provider.handle_tool_call(
+        "astral_namespace", {"action": "set", "namespace": "tree-guardians"},
+    )
+    provider.handle_tool_call("astral_recall", {"query": "spruce"})
+    body = http.payload_for("/v1/memory/search")
+    assert body["namespace_filter"] == "tree-guardians"
+
+
+def test_recall_omits_namespace_filter_when_inactive(provider, http):
+    provider.handle_tool_call("astral_recall", {"query": "spruce"})
+    body = http.payload_for("/v1/memory/search")
+    assert "namespace_filter" not in body
+
+
+def test_recall_per_call_override(provider, http):
+    provider.handle_tool_call(
+        "astral_namespace", {"action": "set", "namespace": "tree-guardians"},
+    )
+    provider.handle_tool_call(
+        "astral_recall", {"query": "spruce", "namespace": "astral-core"},
+    )
+    body = http.payload_for("/v1/memory/search")
+    assert body["namespace_filter"] == "astral-core"
+
+
+def test_recall_all_overrides_active_namespace(provider, http):
+    provider.handle_tool_call(
+        "astral_namespace", {"action": "set", "namespace": "tree-guardians"},
+    )
+    provider.handle_tool_call(
+        "astral_recall", {"query": "spruce", "namespace": "all"},
+    )
+    body = http.payload_for("/v1/memory/search")
+    assert "namespace_filter" not in body
+
+
+def test_store_includes_namespace_when_active(provider, http):
+    provider.handle_tool_call(
+        "astral_namespace", {"action": "set", "namespace": "tree-guardians"},
+    )
+    provider.handle_tool_call("astral_store", {"text": "remember this"})
+    body = http.payload_for("/v1/memory/ingest")
+    assert body["namespace"] == "tree-guardians"
+
+
+def test_store_per_call_override(provider, http):
+    provider.handle_tool_call(
+        "astral_namespace", {"action": "set", "namespace": "tree-guardians"},
+    )
+    provider.handle_tool_call(
+        "astral_store", {"text": "remember this", "namespace": "astral-core"},
+    )
+    body = http.payload_for("/v1/memory/ingest")
+    assert body["namespace"] == "astral-core"
+
+
+def test_store_omits_namespace_when_inactive(provider, http):
+    provider.handle_tool_call("astral_store", {"text": "remember this"})
+    body = http.payload_for("/v1/memory/ingest")
+    assert "namespace" not in body
+
+
+def test_session_switch_resets_namespace(provider, http):
+    provider.handle_tool_call(
+        "astral_namespace", {"action": "set", "namespace": "tree-guardians"},
+    )
+    provider.on_session_switch("session-new", reset=True)
+    provider.sync_turn("user says something here", "assistant responds at length")
+    _drain(provider)
+    body = http.payload_for("/v1/memory/ingest")
+    assert "namespace" not in body
+
+
+def test_config_default_namespace_loaded(monkeypatch, tmp_path, http):
+    """§8.1: default_namespace from config is applied on init."""
+    (tmp_path / "astral-memory.json").write_text(json.dumps({
+        "default_namespace": "astral-core",
+    }))
+    monkeypatch.setattr(astral_memory, "_HttpClient", lambda url: http)
+    p = AstralCoreMemoryProvider()
+    p.initialize("s", hermes_home=str(tmp_path))
+    assert p._config_namespace == "astral-core"
+    # Active namespace should match config on session start.
+    assert p._resolve_namespace() == "astral-core"
+    p.shutdown()
+
+
+def test_config_without_default_namespace(monkeypatch, tmp_path, http):
+    """No default_namespace → cross-namespace mode."""
+    monkeypatch.setattr(astral_memory, "_HttpClient", lambda url: http)
+    p = AstralCoreMemoryProvider()
+    p.initialize("s", hermes_home=str(tmp_path))
+    assert p._config_namespace == ""
+    assert p._resolve_namespace() == ""
+    p.shutdown()
+
+
+def test_config_invalid_namespace_ignored(monkeypatch, tmp_path, http, caplog):
+    """§8.2: invalid config namespace is logged and treated as empty."""
+    (tmp_path / "astral-memory.json").write_text(json.dumps({
+        "default_namespace": "INVALID UPPER",
+    }))
+    monkeypatch.setattr(astral_memory, "_HttpClient", lambda url: http)
+    with caplog.at_level("WARNING", logger="astral-memory"):
+        p = AstralCoreMemoryProvider()
+        p.initialize("s", hermes_home=str(tmp_path))
+    assert p._config_namespace == ""
+    assert any("Invalid default_namespace" in r.getMessage() for r in caplog.records)
+    p.shutdown()
+
+
+def test_server_without_namespace_support_omits_params(monkeypatch, tmp_path):
+    """§14.1: old server (no namespace_enabled in health) → params omitted."""
+
+    class _NoNs(_FakeHttp):
+        def health(self) -> dict:
+            return {
+                "status": "ok", "version": "old", "total_memories": 0,
+                "embedding_backend": "fake", "deep_rerank_enabled": False,
+                "hyde_enabled": False,
+                # No namespace_enabled field.
+            }
+
+    monkeypatch.setattr(astral_memory, "_HttpClient", lambda url: _NoNs())
+    p = AstralCoreMemoryProvider()
+    p.initialize("s", hermes_home=str(tmp_path))
+
+    # Setting namespace should work (stored in state) but _resolve_namespace
+    # returns "" because server doesn't support it.
+    p.handle_tool_call(
+        "astral_namespace", {"action": "set", "namespace": "tree-guardians"},
+    )
+    assert p._resolve_namespace() == ""
+
+    # sync_turn should NOT include namespace in the payload.
+    p.sync_turn("user says something here", "assistant responds at length")
+    _drain(p)
+    body = p._http.payload_for("/v1/memory/ingest")
+    assert "namespace" not in body
+    p.shutdown()
+
+
+def test_delegation_inherits_namespace(provider, http):
+    """§9.3: subagent results inherit the parent's namespace."""
+    provider.handle_tool_call(
+        "astral_namespace", {"action": "set", "namespace": "tree-guardians"},
+    )
+    provider.on_delegation("do the thing", "did the thing", child_session_id="kid-1")
+    _drain(provider)
+    body = http.payload_for("/v1/memory/ingest")
+    assert body["namespace"] == "tree-guardians"
+
+
+def test_pre_compress_includes_namespace(provider, http):
+    """§10.3: pre-compress capture inherits session namespace."""
+    provider.handle_tool_call(
+        "astral_namespace", {"action": "set", "namespace": "astral-core"},
+    )
+    messages = [
+        {"role": "user", "content": "a question long enough to pass the filter"},
+        {"role": "assistant", "content": "an answer"},
+    ]
+    provider.on_pre_compress(messages)
+    _drain(provider)
+    body = http.payload_for("/v1/memory/ingest/batch")
+    assert body["namespace"] == "astral-core"
+
+
+def test_validate_namespace_function():
+    """Direct unit tests for the validation function."""
+    assert astral_memory._validate_namespace("tree-guardians") is None
+    assert astral_memory._validate_namespace("a") is None
+    assert astral_memory._validate_namespace("all") is None
+    assert astral_memory._validate_namespace("abc123") is None
+
+    assert astral_memory._validate_namespace("") is not None
+    assert astral_memory._validate_namespace("UPPER") is not None
+    assert astral_memory._validate_namespace("has space") is not None
+    assert astral_memory._validate_namespace("-leading") is not None
+    assert astral_memory._validate_namespace("trailing-") is not None
+    assert astral_memory._validate_namespace("x" * 65) is not None
+    assert astral_memory._validate_namespace("under_score") is not None
+
+
+def test_save_config_validates_namespace(tmp_path):
+    """save_config should reject invalid namespace and store empty."""
+    p = AstralCoreMemoryProvider()
+    p.save_config({"default_namespace": "INVALID"}, str(tmp_path))
+    cfg = json.loads((tmp_path / "astral-memory.json").read_text())
+    assert cfg["default_namespace"] == ""
+
+
+def test_save_config_accepts_valid_namespace(tmp_path):
+    p = AstralCoreMemoryProvider()
+    p.save_config({"default_namespace": "tree-guardians"}, str(tmp_path))
+    cfg = json.loads((tmp_path / "astral-memory.json").read_text())
+    assert cfg["default_namespace"] == "tree-guardians"
+
+
+def test_briefing_is_cross_namespace(provider, http):
+    """§7.1: briefings are intentionally cross-namespace."""
+    provider.handle_tool_call(
+        "astral_namespace", {"action": "set", "namespace": "tree-guardians"},
+    )
+    provider.handle_tool_call("astral_briefing", {})
+    # Briefing endpoint should NOT receive a namespace filter.
+    for _, path, body in http.calls:
+        if path == "/v1/memory/briefing":
+            assert body is None or "namespace" not in (body or {})
+            return
+    # If we get here, the briefing call didn't happen — that's also fine.
+
+
+# ---------------------------------------------------------------------------
+# 9. The guard itself
 # ---------------------------------------------------------------------------
 
 def test_assert_contract_passes_on_current_provider(caplog):
