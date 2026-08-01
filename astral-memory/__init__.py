@@ -1,6 +1,32 @@
-# Generation Timestamp: 2026-07-30T20:00:00Z
+# Generation Timestamp: 2026-08-01T22:00:00Z
 #
 # astral-memory/__init__.py
+# v2.5.0 CHANGES (GW-1 root-cause fix — Bearer authentication):
+#   FIX  — The plugin sent NO Authorization header on any request. When the
+#          server began enforcing Bearer auth, every call started failing
+#          with 401 — swallowed silently by the framework's MemoryManager.
+#          Confirmed on the wire (tcpdump, 2026-08-01): POST → 401, no
+#          Bearer header present. The `api_token` key in astral-memory.json
+#          was read by nobody. Signal memory capture was dead the entire
+#          time while the agent answered fluently.
+#   NEW  — _HttpClient sends `Authorization: Bearer <token>` on every
+#          request (including health) when a token is configured.
+#   NEW  — `api_token` read from astral-memory.json in _load_config();
+#          ASTRAL_API_TOKEN env var overrides (parallel to ASTRAL_SERVER_URL).
+#   NEW  — 401/403 are logged at ERROR, always. Auth failure must never be
+#          silent again; the silence cost a full evening of forensics and an
+#          unknown span of lost memories.
+#   NEW  — One-shot token refresh on 401: the client re-reads the config
+#          file once and retries, making server-side token rotation
+#          self-healing without a gateway restart.
+#   NEW  — Prefetch consumes `namespace_fallback` from the server response
+#          (NS-1, server >= this deploy): when the requested namespace had
+#          zero results and the server fell back to cross-namespace, the
+#          injected context block is labeled so the agent knows. Graceful
+#          on older servers (key absent → no label).
+#   NOTE — 401/403 do NOT trip the circuit breaker (HTTPError branch already
+#          calls _record_success(); preserved). Auth-broken ≠ server-down.
+#
 # v2.4.0 CHANGES (SPEC-NAMESPACE-001 v1.0 — Memory Namespace Architecture):
 #   NEW  — Namespace support. Memories are partitioned by context (project,
 #          topic, game world) via a slug string. The server stores and filters
@@ -160,7 +186,7 @@ logger = logging.getLogger("astral-memory")
 # Constants
 # ---------------------------------------------------------------------------
 
-_VERSION = "2.4.0"
+_VERSION = "2.5.0"
 _DEFAULT_SERVER_URL = "http://localhost:8090"
 _DEFAULT_DATA_DIR = "~/.astral"
 
@@ -189,11 +215,36 @@ _NS_MAX_LEN = 64
 class _HttpClient:
     """HTTP client with a thread-safe circuit breaker."""
 
-    def __init__(self, base_url: str):
+    def __init__(self, base_url: str, api_token: str = "",
+                 token_loader=None):
         self.base_url = base_url.rstrip("/")
         self._lock = threading.Lock()
         self._failures = 0
         self._circuit_open_at: float = 0.0
+        # v2.5.0: Bearer auth. token_loader is an optional zero-arg callable
+        # returning the current token from config — used for the one-shot
+        # refresh on 401 so token rotation self-heals.
+        self._api_token = api_token or ""
+        self._token_loader = token_loader
+
+    def _headers(self) -> Optional[dict]:
+        if self._api_token:
+            return {"Authorization": f"Bearer {self._api_token}"}
+        return None
+
+    def _refresh_token(self) -> bool:
+        """Re-read the token via token_loader. True if it changed."""
+        if self._token_loader is None:
+            return False
+        try:
+            fresh = str(self._token_loader() or "")
+        except Exception:  # noqa: BLE001
+            return False
+        if fresh and fresh != self._api_token:
+            self._api_token = fresh
+            logger.warning("Auth token refreshed from config after 401")
+            return True
+        return False
 
     def _circuit_open(self) -> bool:
         with self._lock:
@@ -230,8 +281,20 @@ class _HttpClient:
                 f"{self.base_url}{path}",
                 json=payload if method in ("POST", "PUT", "PATCH") else None,
                 params=params,
+                headers=self._headers(),  # v2.5.0: Bearer auth
                 timeout=timeout,
             )
+            # v2.5.0: one-shot token refresh + retry on auth failure —
+            # server-side token rotation self-heals without a restart.
+            if r.status_code in (401, 403) and self._refresh_token():
+                r = requests.request(
+                    method,
+                    f"{self.base_url}{path}",
+                    json=payload if method in ("POST", "PUT", "PATCH") else None,
+                    params=params,
+                    headers=self._headers(),
+                    timeout=timeout,
+                )
             r.raise_for_status()
             self._record_success()
             return r.json()
@@ -246,11 +309,21 @@ class _HttpClient:
         except requests.HTTPError as e:
             # Server is alive — it just said no. Don't trip the breaker.
             self._record_success()
+            status = e.response.status_code
+            if status in (401, 403):
+                # v2.5.0: auth failure is NEVER silent. This exact silence
+                # hid a dead capture pipeline for an unknown span of time.
+                logger.error(
+                    "Memory server rejected auth (HTTP %d) on %s %s — "
+                    "check api_token in astral-memory.json against "
+                    "the server's token file",
+                    status, method, path,
+                )
             try:
                 body = e.response.json()
             except Exception:
                 body = {"detail": e.response.text[:200]}
-            return {"error": f"HTTP {e.response.status_code}", **body}
+            return {"error": f"HTTP {status}", **body}
         except Exception as e:  # noqa: BLE001 — never let a bridge kill a turn
             self._record_failure()
             return {"error": str(e)}
@@ -269,7 +342,9 @@ class _HttpClient:
     def health(self) -> Optional[dict]:
         """Health check with a short timeout. Returns None on failure."""
         try:
-            r = requests.get(f"{self.base_url}/health", timeout=_CONNECT_TIMEOUT)
+            r = requests.get(f"{self.base_url}/health",
+                             headers=self._headers(),  # v2.5.0
+                             timeout=_CONNECT_TIMEOUT)
             if r.status_code == 200:
                 return r.json()
         except Exception:
@@ -386,6 +461,7 @@ class AstralCoreMemoryProvider(MemoryProvider):
         self._briefing_on_start: bool = False
         self._min_similarity: Optional[float] = None
         self._data_dir: str = _DEFAULT_DATA_DIR
+        self._api_token: str = ""  # v2.5.0: Bearer auth
 
     # ------------------------------------------------------------------
     # Identity & availability
@@ -420,7 +496,14 @@ class AstralCoreMemoryProvider(MemoryProvider):
             max_workers=_MAX_WORKERS,
             thread_name_prefix="astral-memory",
         )
-        self._http = _HttpClient(self._server_url)
+        self._http = _HttpClient(
+            self._server_url,
+            api_token=self._api_token,
+            # v2.5.0: one-shot refresh source — re-read config on 401.
+            token_loader=lambda: _read_config(self._hermes_home).get(
+                "api_token", ""
+            ),
+        )
 
         health = self._http.health()
         if health:
@@ -502,6 +585,13 @@ class AstralCoreMemoryProvider(MemoryProvider):
         env_url = os.environ.get("ASTRAL_SERVER_URL")
         if env_url:
             self._server_url = env_url
+
+        # v2.5.0: Bearer auth token. Config key `api_token`; env var
+        # ASTRAL_API_TOKEN overrides (parallel to ASTRAL_SERVER_URL).
+        self._api_token = str(cfg.get("api_token", "") or "")
+        env_token = os.environ.get("ASTRAL_API_TOKEN")
+        if env_token:
+            self._api_token = env_token
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -803,6 +893,17 @@ class AstralCoreMemoryProvider(MemoryProvider):
             return ""
 
         block = str(data.get("context_block", "") or "")
+
+        # v2.5.0 / NS-1: the server flags when the requested namespace had
+        # zero results and it fell back to cross-namespace. Label the block
+        # so the agent knows these memories are from outside the active
+        # namespace. Graceful on older servers (key absent → no label).
+        if block and data.get("namespace_fallback") is True:
+            ns = self._resolve_namespace()
+            block = (
+                f"[note: no memories found in namespace '{ns}' — "
+                f"the following are cross-namespace results]\n" + block
+            )
 
         # Track which memories the server injected (server >= v2.12.x
         # returns `memory_ids`; older servers omit it — treat as empty,
