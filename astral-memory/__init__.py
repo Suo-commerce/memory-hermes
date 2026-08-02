@@ -1,6 +1,44 @@
-# Generation Timestamp: 2026-08-01T22:00:00Z
+# Generation Timestamp: 2026-08-02T00:15:00Z
 #
 # astral-memory/__init__.py
+# v2.5.2 CHANGES (fifth broken link — T6 trigger):
+#   FIX  — on_session_end() now ALSO calls POST /v1/memory/session-end,
+#          which fires DreamerEvent::SessionCompleted → T6 /
+#          run_dream_shark() → episode summary + timeline markers.
+#          Previously the hook only wrote the diary entry; the Dreamer
+#          never learned any session had ended, so T6 has never fired in
+#          production. (Historical note: this exact chain was previously
+#          broken on the SERVER side — the endpoint didn't exist and
+#          astral-session-end.sh silently 404'd, fixed in server v14.
+#          Both ends have now failed independently. The chain deserves a
+#          liveness invariant: episodes_generated > 0 after N sessions.)
+#          Contract per server types.rs: {session_id?, project_dir?} —
+#          NO turns array; the Dreamer collects the session's turn
+#          memories from the corpus (per-turn ingests already stored
+#          them). session-end is fired BEFORE the diary write so the
+#          Dreamer event is not lost if the diary call raises during
+#          pool teardown.
+#
+# v2.5.1 CHANGES (GW-1 follow-ups):
+#   FIX  — health() now calls /v1/health (authenticated) instead of the
+#          public /health. SEC-FIX-3 deliberately trimmed the public
+#          endpoint to liveness-only (no corpus stats leak unauthenticated);
+#          the plugin was reading the trimmed body and displaying
+#          "0 memories". The plugin has the Bearer token — it uses the
+#          protected endpoint that carries total_memories + feature flags.
+#          Falls back to public /health when no token is configured
+#          (unauth'd servers keep working, liveness still detected).
+#   FIX  — Default server_url is http://127.0.0.1:8090 (was localhost).
+#          Python resolves localhost to ::1 first; the server binds IPv4
+#          only. The resulting connection failures tripped the circuit
+#          breaker in 60s waves since 2026-07-29. Explicit IPv4 removes
+#          the resolver from the failure surface. Existing configs with
+#          "localhost" are rewritten to 127.0.0.1 at load (same host,
+#          zero behavior change on IPv4-only setups, cures dual-stack).
+#   NEW  — ConnectionError is logged at WARNING with the target URL, once
+#          per breaker cycle (first failure + breaker-open). Connection
+#          failures were previously silent until the breaker warning.
+#
 # v2.5.0 CHANGES (GW-1 root-cause fix — Bearer authentication):
 #   FIX  — The plugin sent NO Authorization header on any request. When the
 #          server began enforcing Bearer auth, every call started failing
@@ -186,8 +224,8 @@ logger = logging.getLogger("astral-memory")
 # Constants
 # ---------------------------------------------------------------------------
 
-_VERSION = "2.5.0"
-_DEFAULT_SERVER_URL = "http://localhost:8090"
+_VERSION = "2.5.2"
+_DEFAULT_SERVER_URL = "http://127.0.0.1:8090"
 _DEFAULT_DATA_DIR = "~/.astral"
 
 _CONNECT_TIMEOUT = 3.0
@@ -299,6 +337,16 @@ class _HttpClient:
             self._record_success()
             return r.json()
         except requests.ConnectionError:
+            # v2.5.1: log the first failure of a breaker cycle with the
+            # target URL — connection failures (e.g. the localhost/IPv6
+            # class) were invisible until the breaker-open warning.
+            with self._lock:
+                first_of_cycle = self._failures == 0
+            if first_of_cycle:
+                logger.warning(
+                    "Connection to memory server failed: %s%s",
+                    self.base_url, path,
+                )
             self._record_failure()
             return {"error": f"Memory server not reachable at {self.base_url}"}
         except requests.Timeout:
@@ -340,10 +388,18 @@ class _HttpClient:
         return self._request("DELETE", path, timeout=timeout)
 
     def health(self) -> Optional[dict]:
-        """Health check with a short timeout. Returns None on failure."""
+        """Health check with a short timeout. Returns None on failure.
+
+        v2.5.1: uses the PROTECTED /v1/health when a token is configured —
+        the public /health is deliberately liveness-only (SEC-FIX-3: no
+        corpus stats leak unauthenticated), which is why the plugin used
+        to display "0 memories". Tokenless configs fall back to the
+        public endpoint for liveness.
+        """
+        path = "/v1/health" if self._api_token else "/health"
         try:
-            r = requests.get(f"{self.base_url}/health",
-                             headers=self._headers(),  # v2.5.0
+            r = requests.get(f"{self.base_url}{path}",
+                             headers=self._headers(),
                              timeout=_CONNECT_TIMEOUT)
             if r.status_code == 200:
                 return r.json()
@@ -549,6 +605,17 @@ class AstralCoreMemoryProvider(MemoryProvider):
     def _load_config(self) -> None:
         cfg = _read_config(self._hermes_home)
         self._server_url = cfg.get("server_url", self._server_url)
+        # v2.5.1: localhost resolves to ::1 first on dual-stack Python;
+        # the server binds IPv4 only. Rewrite to explicit IPv4 — same
+        # host, removes the resolver from the failure surface.
+        if "//localhost" in self._server_url:
+            self._server_url = self._server_url.replace(
+                "//localhost", "//127.0.0.1", 1
+            )
+            logger.info(
+                "server_url 'localhost' rewritten to 127.0.0.1 "
+                "(IPv6-first resolution workaround)"
+            )
         self._auto_capture = bool(cfg.get("auto_capture", self._auto_capture))
         self._auto_recall = bool(cfg.get("auto_recall", self._auto_recall))
         self._max_recall = int(cfg.get("max_recall_memories", self._max_recall))
@@ -1093,11 +1160,34 @@ class AstralCoreMemoryProvider(MemoryProvider):
         )
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        """Write a diary summary when the session ends."""
+        """Notify the Dreamer the session ended, then write a diary summary.
+
+        v2.5.2: the session-end notification is the trigger for the entire
+        episode layer (DreamerEvent::SessionCompleted → T6 → episode
+        summary + timeline markers). It was missing; only the diary was
+        written. Fired first and synchronously — the pool may be torn
+        down right after this hook, and the Dreamer event matters more
+        than the diary entry.
+        """
         if not self._ready() or not messages:
             return
 
         sid = self._sid()
+
+        # ── v2.5.2: fire SessionCompleted (T6 trigger) ──────────────────
+        end_result = self._http.post("/v1/memory/session-end", {
+            "session_id": sid or "",
+        })
+        if "error" in end_result:
+            logger.warning(
+                "session-end notification failed (T6 episode will not be "
+                "generated for session %s): %s", sid, end_result["error"],
+            )
+        else:
+            logger.info(
+                "SessionCompleted sent for session %s — episode generation "
+                "dispatched to Dreamer", sid,
+            )
 
         lines: List[str] = []
         for msg in messages[-6:]:
