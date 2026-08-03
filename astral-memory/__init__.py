@@ -1051,7 +1051,7 @@ class AstralCoreMemoryProvider(MemoryProvider):
 
         return json.dumps({
             "success": True,
-            "id": result.get("id", ""),
+            "id": result.get("memory_id", result.get("id", "")),
             "text": text,
             "status": "active",
             "note": "Preference declared and immediately active.",
@@ -1064,19 +1064,14 @@ class AstralCoreMemoryProvider(MemoryProvider):
     def system_prompt_block(self) -> str:
         if not self._server_healthy:
             return ""
-        # Check for active preferences to mention them.
+        # v2.7.0: mention preferences if any were injected last turn.
+        # Uses the cached flag from _do_prefetch — no HTTP call here.
+        # The injection block itself makes the preferences visible;
+        # this note tells the agent the capability is live.
         pref_note = ""
-        if self._server_healthy:
-            pref_data = self._http.post("/v1/memory/list", {
-                "namespace": "preferences", "limit": 1,
-            })
-            if "error" not in pref_data:
-                active = [
-                    m for m in pref_data.get("memories", [])
-                    if (m.get("metadata") or {}).get("status") == "active"
-                ]
-                if active:
-                    pref_note = " Preferences active (injected below)."
+        with self._state_lock:
+            if getattr(self, "_last_pref_count", 0) > 0:
+                pref_note = " Preferences active (injected below)."
 
         return (
             "[Astral Core Memory active — surprise-gated, offline, "
@@ -1179,6 +1174,16 @@ class AstralCoreMemoryProvider(MemoryProvider):
         # namespace. Total injection (no rotation) — the §4 cap (12
         # active, 1500 chars) guarantees this stays smaller than one
         # tool result. Filtered client-side by status == active.
+        #
+        # §5 self-sustaining loop: the server's list_memories handler
+        # fires record_hit for every memory returned when the namespace
+        # is "preferences" (R3 fix, server campaign). This means every
+        # injection-fetch accumulates spaced access on active preferences,
+        # keeping them SLOW via genuine usage — the lifecycle IS the
+        # retirement mechanism. If the server ever changes list_memories
+        # to NOT record hits, this loop breaks silently — the §9 liveness
+        # invariant (preferences_active declining unexpectedly) is the
+        # detection signal.
         pref_block = ""
         pref_data = self._http.post("/v1/memory/list", {
             "namespace": "preferences",
@@ -1210,6 +1215,14 @@ class AstralCoreMemoryProvider(MemoryProvider):
                 len(active_prefs), len(active_prefs), total_chars,
                 ",".join(active_ids) if active_ids else "none",
             )
+
+            # Cache the count for system_prompt_block (no HTTP call there).
+            with self._state_lock:
+                self._last_pref_count = len(active_prefs)
+
+        if not pref_block:
+            with self._state_lock:
+                self._last_pref_count = 0
 
         if pref_block:
             block = block + pref_block if block else pref_block.strip()
