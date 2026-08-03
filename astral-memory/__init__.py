@@ -1,6 +1,31 @@
-# Generation Timestamp: 2026-08-02T00:15:00Z
+# Generation Timestamp: 2026-08-02T19:30:00Z
 #
 # astral-memory/__init__.py
+# v2.5.3 CHANGES (SPEC-PLUGIN-SESSION-END-002 v1.0.0 — sixth broken link):
+#   FIX  — v2.5.2's session-end notification fired correctly, but the
+#          Dreamer's corpus lookup for the session's turns SILENTLY found
+#          zero: the server assigns its own internal session_id on ingest
+#          (incrementing integer) which never matches the plugin's Hermes
+#          session UUID. Event fired, Dreamer woke, looked up the wrong
+#          name, produced nothing, logged nothing. (Diagnosed by the
+#          Hermes Agent, 2026-08-02.)
+#   NEW  — on_session_end() now calls POST /v1/episodes/generate DIRECTLY
+#          with the full transcript (>=3 turns) — the reliable path that
+#          carries its own turns instead of trusting an ID lookup.
+#          Turn shape per server types.rs EpisodeTurn: {"text", "speaker"}
+#          (spec's locked assumption 2 said {"role","text"} — corrected).
+#   KEPT — POST /v1/memory/session-end still fired afterward (Dreamer
+#          event for timeline markers / HOPE signals; no longer the
+#          episode-text path — logging downgraded INFO→DEBUG on success).
+#   KEPT — diary write unchanged, last.
+#   ORDER — episodes/generate FIRST (the valuable artifact), then
+#          session-end, then diary; all synchronous (pool may be torn
+#          down right after this hook).
+#   SRV-2 (server follow-up, out of plugin scope): ingest should persist
+#          the caller-supplied session_id so Dreamer ID-based collection
+#          works for all clients; until then every client of session-end
+#          silently generates nothing.
+#
 # v2.5.2 CHANGES (fifth broken link — T6 trigger):
 #   FIX  — on_session_end() now ALSO calls POST /v1/memory/session-end,
 #          which fires DreamerEvent::SessionCompleted → T6 /
@@ -224,7 +249,7 @@ logger = logging.getLogger("astral-memory")
 # Constants
 # ---------------------------------------------------------------------------
 
-_VERSION = "2.5.2"
+_VERSION = "2.5.3"
 _DEFAULT_SERVER_URL = "http://127.0.0.1:8090"
 _DEFAULT_DATA_DIR = "~/.astral"
 
@@ -1160,34 +1185,69 @@ class AstralCoreMemoryProvider(MemoryProvider):
         )
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        """Notify the Dreamer the session ended, then write a diary summary.
+        """Generate the session episode, notify the Dreamer, write the diary.
 
-        v2.5.2: the session-end notification is the trigger for the entire
-        episode layer (DreamerEvent::SessionCompleted → T6 → episode
-        summary + timeline markers). It was missing; only the diary was
-        written. Fired first and synchronously — the pool may be torn
-        down right after this hook, and the Dreamer event matters more
-        than the diary entry.
+        SPEC-PLUGIN-SESSION-END-002 v1.0.0. Order matters and everything
+        is synchronous — the pool may be torn down right after this hook:
+          1. /v1/episodes/generate with the explicit transcript (>=3
+             turns) — the reliable episode path. The Dreamer's ID-based
+             collection finds zero turns (server-internal session_id
+             never matches the Hermes UUID; see SRV-2 in header).
+          2. /v1/memory/session-end — Dreamer event, retained for
+             timeline markers and HOPE signals.
+          3. Diary summary (unchanged).
         """
         if not self._ready() or not messages:
             return
 
         sid = self._sid()
 
-        # ── v2.5.2: fire SessionCompleted (T6 trigger) ──────────────────
+        # ── 1. Extract transcript turns ─────────────────────────────────
+        turns: List[Dict[str, str]] = []
+        for msg in messages:
+            role = msg.get("role", "")
+            content = str(msg.get("content", "") or "").strip()
+            if content and role in ("user", "assistant"):
+                turns.append({
+                    "text": content[: self._capture_max_chars],
+                    "speaker": role,  # server EpisodeTurn: text + speaker
+                })
+
+        # ── 2. Direct episode generation (reliable path) ────────────────
+        if len(turns) >= 3:
+            ep = self._http.post("/v1/episodes/generate", {
+                "session_id": sid or "",
+                "turns": turns,
+            })
+            if "error" in ep:
+                logger.warning(
+                    "Episode generation failed for session %s: %s",
+                    sid, ep["error"],
+                )
+            else:
+                logger.info(
+                    "Episode generated for session %s: stored=%s backend=%s "
+                    "turns=%d",
+                    sid, ep.get("stored"), ep.get("llm_backend_used"),
+                    len(turns),
+                )
+        else:
+            logger.debug(
+                "Session %s ended with %d turns (<3) — episode skipped",
+                sid, len(turns),
+            )
+
+        # ── 3. Dreamer event (timeline markers / HOPE — not episode text) ─
         end_result = self._http.post("/v1/memory/session-end", {
             "session_id": sid or "",
         })
         if "error" in end_result:
             logger.warning(
-                "session-end notification failed (T6 episode will not be "
-                "generated for session %s): %s", sid, end_result["error"],
+                "session-end notification failed for session %s: %s",
+                sid, end_result["error"],
             )
         else:
-            logger.info(
-                "SessionCompleted sent for session %s — episode generation "
-                "dispatched to Dreamer", sid,
-            )
+            logger.debug("SessionCompleted sent for session %s", sid)
 
         lines: List[str] = []
         for msg in messages[-6:]:
