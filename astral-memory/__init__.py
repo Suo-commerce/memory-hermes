@@ -1,6 +1,21 @@
-# Generation Timestamp: 2026-08-02T19:30:00Z
+# Generation Timestamp: 2026-08-03T16:00:00Z
 #
 # astral-memory/__init__.py
+# v2.7.0 CHANGES (SPEC-PREFERENCE-DISTILLATION-001 — plugin campaign):
+#   NEW  — astral_preferences tool: 5 actions (pending/approve/decline/
+#          withdraw/declare). The consent surface for H7-discovered and
+#          user-declared preferences. Each action maps to server endpoints
+#          shipped in the server campaign (list, PATCH, guarded add).
+#   NEW  — Preference injection in _do_prefetch: second fetch via POST
+#          /v1/memory/list for the preferences namespace; status == active
+#          filtered client-side; rendered as a distinct [USER PREFERENCES]
+#          block in canonical form (one sentence each, ≤140 chars). Total
+#          injection (no rotation) — the §4 cap guarantees ≤1500 chars.
+#   NEW  — Injection trace: DEBUG log per turn with injected preference
+#          IDs, count, chars. The §5.2 requirement and the six-silent-
+#          failures lesson applied prophylactically.
+#   NEW  — system_prompt_block mentions preferences when active.
+#
 # v2.5.3 CHANGES (SPEC-PLUGIN-SESSION-END-002 v1.0.0 — sixth broken link):
 #   FIX  — v2.5.2's session-end notification fired correctly, but the
 #          Dreamer's corpus lookup for the session's turns SILENTLY found
@@ -249,7 +264,7 @@ logger = logging.getLogger("astral-memory")
 # Constants
 # ---------------------------------------------------------------------------
 
-_VERSION = "2.5.3"
+_VERSION = "2.7.0"
 _DEFAULT_SERVER_URL = "http://127.0.0.1:8090"
 _DEFAULT_DATA_DIR = "~/.astral"
 
@@ -740,6 +755,7 @@ class AstralCoreMemoryProvider(MemoryProvider):
             schemas.ASTRAL_STATS,
             schemas.ASTRAL_SYNC,
             schemas.ASTRAL_NAMESPACE,
+            schemas.ASTRAL_PREFERENCES,
         ]
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any],
@@ -763,6 +779,7 @@ class AstralCoreMemoryProvider(MemoryProvider):
             "astral_stats":    self._tool_stats,
             "astral_sync":     self._tool_sync,
             "astral_namespace": self._tool_namespace,
+            "astral_preferences": self._tool_preferences,
         }
 
         handler = dispatch.get(tool_name)
@@ -917,15 +934,154 @@ class AstralCoreMemoryProvider(MemoryProvider):
         return json.dumps({"error": f"Unknown action: {action}"})
 
     # ------------------------------------------------------------------
+    # Preferences — consent surface (SPEC-PREFERENCE-DISTILLATION-001)
+    # ------------------------------------------------------------------
+
+    def _tool_preferences(self, args: dict, session_id: str) -> str:
+        """Manage learned user preferences (§6 consent flow)."""
+        action = args.get("action", "pending")
+
+        if action == "pending":
+            return self._pref_pending()
+        elif action == "approve":
+            return self._pref_transition(args, "active")
+        elif action == "decline":
+            return self._pref_transition(args, "declined")
+        elif action == "withdraw":
+            return self._pref_transition(args, "withdrawn")
+        elif action == "declare":
+            return self._pref_declare(args)
+        else:
+            return json.dumps({"error": f"Unknown action: {action}"})
+
+    def _pref_pending(self) -> str:
+        """List pending preference nominations with evidence."""
+        data = self._http.post("/v1/memory/list", {
+            "namespace": "preferences",
+            "limit": 50,
+        })
+        if "error" in data:
+            return json.dumps({"error": data["error"]})
+
+        pending = []
+        for m in data.get("memories", []):
+            status = (m.get("metadata") or {}).get("status", "")
+            if status != "pending":
+                continue
+            # Fetch evidence snippets from supporting memory IDs
+            support_ids = (m.get("metadata") or {}).get(
+                "supporting_memory_ids", []
+            )
+            snippets = []
+            for sid in support_ids[:3]:  # EVIDENCE_SNIPPET_COUNT = 3
+                mem_data = self._http.get(f"/v1/memory/{sid}")
+                if "error" not in mem_data and "memory" in mem_data:
+                    mem = mem_data["memory"]
+                    snippets.append({
+                        "id": sid,
+                        "text": mem.get("text", "")[:200],
+                        "created_at": mem.get("created_at", ""),
+                    })
+            pending.append({
+                "id": m["id"],
+                "proposed_text": m["text"],
+                "category": m.get("category", ""),
+                "evidence_sessions": (m.get("metadata") or {}).get(
+                    "evidence_sessions", 0
+                ),
+                "evidence_span_days": (m.get("metadata") or {}).get(
+                    "evidence_span_days", 0
+                ),
+                "evidence_snippets": snippets,
+            })
+
+        return json.dumps({
+            "pending_count": len(pending),
+            "nominations": pending,
+            "hint": (
+                "Present each nomination to the user with its evidence. "
+                "Ask: 'Should I remember this as a standing preference?' "
+                "Use approve/decline with the preference_id."
+            ) if pending else "No pending nominations.",
+        }, indent=2)
+
+    def _pref_transition(self, args: dict, new_status: str) -> str:
+        """Approve, decline, or withdraw a preference via PATCH."""
+        pref_id = args.get("preference_id", "").strip()
+        if not pref_id:
+            return json.dumps({"error": "preference_id is required"})
+
+        result = self._http.request(
+            "PATCH",
+            f"/v1/memory/{pref_id}",
+            payload={"metadata": {"status": new_status}},
+        )
+        if "error" in result:
+            return json.dumps({"error": result["error"]})
+
+        return json.dumps({
+            "success": True,
+            "id": pref_id,
+            "new_status": new_status,
+            "changed": result.get("changed", []),
+        }, indent=2)
+
+    def _pref_declare(self, args: dict) -> str:
+        """Declare a user preference directly (bypasses H7 discovery)."""
+        text = (args.get("text") or "").strip()
+        if not text:
+            return json.dumps({"error": "text is required for declare"})
+        if len(text) > 140:
+            return json.dumps({
+                "error": f"Preference text too long ({len(text)} chars, max 140)"
+            })
+
+        result = self._http.post("/v1/memory/add", {
+            "text": text,
+            "namespace": "preferences",
+            "source": "user_declared",
+            "metadata": {
+                "status": "active",  # consent inherent in declaration
+                "source": "user_declared",
+                "category": "preference",
+            },
+        })
+        if "error" in result:
+            return json.dumps({"error": result["error"]})
+
+        return json.dumps({
+            "success": True,
+            "id": result.get("id", ""),
+            "text": text,
+            "status": "active",
+            "note": "Preference declared and immediately active.",
+        }, indent=2)
+
+    # ------------------------------------------------------------------
     # System prompt
     # ------------------------------------------------------------------
 
     def system_prompt_block(self) -> str:
         if not self._server_healthy:
             return ""
+        # Check for active preferences to mention them.
+        pref_note = ""
+        if self._server_healthy:
+            pref_data = self._http.post("/v1/memory/list", {
+                "namespace": "preferences", "limit": 1,
+            })
+            if "error" not in pref_data:
+                active = [
+                    m for m in pref_data.get("memories", [])
+                    if (m.get("metadata") or {}).get("status") == "active"
+                ]
+                if active:
+                    pref_note = " Preferences active (injected below)."
+
         return (
             "[Astral Core Memory active — surprise-gated, offline, "
-            f"{self._max_recall} memories per turn. "
+            f"{self._max_recall} memories per turn."
+            f"{pref_note} "
             "Use astral_recall before answering from past context.]"
         )
 
@@ -1017,6 +1173,46 @@ class AstralCoreMemoryProvider(MemoryProvider):
                 text = str(card.get("briefing", "") or "") if "error" not in card else ""
                 if text:
                     block = f"{text}\n\n{block}".strip()
+
+        # ── SPEC-PREFERENCE-DISTILLATION-001 §5: always-on injection ────
+        # Second fetch: all active preferences from the preferences
+        # namespace. Total injection (no rotation) — the §4 cap (12
+        # active, 1500 chars) guarantees this stays smaller than one
+        # tool result. Filtered client-side by status == active.
+        pref_block = ""
+        pref_data = self._http.post("/v1/memory/list", {
+            "namespace": "preferences",
+            "limit": 50,
+        })
+        if "error" not in pref_data:
+            active_prefs = []
+            active_ids = []
+            for m in pref_data.get("memories", []):
+                status = (m.get("metadata") or {}).get("status", "")
+                if status == "active":
+                    # §5.1: canonical injected form — one sentence, ≤140 chars
+                    canonical = m.get("text", "")[:140].strip()
+                    if canonical:
+                        active_prefs.append(f"- {canonical}")
+                        active_ids.append(m.get("id", "?"))
+
+            if active_prefs:
+                pref_block = (
+                    "\n[USER PREFERENCES — learned, consented]\n"
+                    + "\n".join(active_prefs)
+                    + "\n[/USER PREFERENCES]"
+                )
+
+            # §5.2: injection trace — per-turn DEBUG log
+            total_chars = sum(len(p) for p in active_prefs)
+            logger.debug(
+                "Preference injection: active=%d injected=%d chars=%d ids=%s",
+                len(active_prefs), len(active_prefs), total_chars,
+                ",".join(active_ids) if active_ids else "none",
+            )
+
+        if pref_block:
+            block = block + pref_block if block else pref_block.strip()
 
         return block
 

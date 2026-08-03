@@ -1,11 +1,16 @@
-# Generation Timestamp: 2026-07-30T20:00:00Z
+# Generation Timestamp: 2026-08-03T15:30:00Z
 """
 Tool schemas — what the LLM reads to decide when to call Astral Core tools.
-Version: 2.4.0
+Version: 2.7.0
 
 These are returned by AstralCoreMemoryProvider.get_tool_schemas() and
 injected into the Hermes tool registry automatically.  The LLM sees
 them alongside built-in tools.
+
+v2.7.0 CHANGES (SPEC-PREFERENCE-DISTILLATION-001 v1.0):
+  NEW  — ASTRAL_PREFERENCES schema: five-action consent surface for
+         learned user preferences. Actions: pending (list nominations
+         with evidence), approve, decline, withdraw, declare.
 
 v2.4.0 CHANGES (SPEC-NAMESPACE-001):
   NEW  — `namespace` parameter on astral_recall and astral_store.
@@ -197,6 +202,64 @@ ASTRAL_NAMESPACE = {
                 "description": (
                     "Namespace slug (lowercase alphanumeric with hyphens). "
                     "Required for 'set'."
+                ),
+            },
+        },
+        "required": ["action"],
+    },
+}
+
+# ── SPEC-PREFERENCE-DISTILLATION-001 v1.0 ─────────────────────────────────
+# Consent surface for learned user preferences. H7 discovers behavioral
+# patterns; the agent surfaces nominations via this tool; the user
+# approves/declines/withdraws. Approved preferences are injected every
+# turn as persistent behavioral context.
+
+ASTRAL_PREFERENCES = {
+    "name": "astral_preferences",
+    "description": (
+        "Manage learned user preferences. The memory system discovers "
+        "recurring behavioral patterns (H7 hunt) and nominates them for "
+        "your approval. Approved preferences are injected every turn as "
+        "persistent context — they shape how you respond. You can also "
+        "declare preferences directly when the user states one explicitly."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["pending", "approve", "decline", "withdraw", "declare"],
+                "description": (
+                    "pending — list nominations awaiting user consent "
+                    "(returns proposed text + evidence snippets with dates); "
+                    "approve — activate a pending preference (user consented); "
+                    "decline — reject a nomination (blocks re-nomination of "
+                    "similar patterns); "
+                    "withdraw — revoke an active preference the user no "
+                    "longer wants (must have been active; kept for audit); "
+                    "declare — create a new preference from an explicit user "
+                    "statement like 'remember: I prefer X' (bypasses H7 "
+                    "discovery; consent is inherent in declaration)."
+                ),
+            },
+            "preference_id": {
+                "type": "string",
+                "description": (
+                    "Memory ID of the preference to act on. "
+                    "Required for approve, decline, and withdraw. "
+                    "Get IDs from the pending action's response. "
+                    "Ignored for pending and declare."
+                ),
+            },
+            "text": {
+                "type": "string",
+                "description": (
+                    "The preference text for declare action. Must be one "
+                    "declarative sentence about the USER's preference — not "
+                    "an instruction to you. Max 140 characters. "
+                    "Example: 'Prefers one generated file per reply.' "
+                    "Required for declare. Ignored for other actions."
                 ),
             },
         },
