@@ -1,6 +1,25 @@
-# Generation Timestamp: 2026-08-03T16:00:00Z
+# Generation Timestamp: 2026-08-11T01:30:00Z
+# Purpose: Hermes memory plugin — v2.7.1 removes client-side length filters
+#          (N-10a/N-10b) so short high-signal turns reach the server-side
+#          pipeline per SPEC-EPISODE-BOUNDARY-001 / SEC-ORD-1.
 #
 # astral-memory/__init__.py
+# v2.7.1 CHANGES (INCIDENT-BOTJARMO-NULLBRAIN-001 N-10 — pre-filter removal):
+#   FIX  — sync_turn(): the v2.3.0 "<8 combined words" pre-filter is
+#          removed (N-10a). Short turns are often the highest-signal ones
+#          ("Mina the Hollower" = 3 words, dropped client-side, root cause
+#          #4 of the Mina incident). SPEC-EPISODE-BOUNDARY-001 moves noise
+#          filtering server-side (SEC-ORD-1: redact → spool-append → noise
+#          → gate); a client word count violates the raw-turn spool's
+#          completeness guarantee. Only whitespace-only turns are skipped.
+#   FIX  — on_pre_compress(): the `len(user_text) > 20` char gate is
+#          removed (N-10b) for the same reason; non-empty is sufficient.
+#   NOTE — The v2.3.0 rationale ("junk feeds Dreamer episode generation")
+#          is obsolete once the server-side spool ships; until then the
+#          server's noise filter + surprise gate absorb the extra volume.
+#          Rejected alternative: lowering the threshold to a smaller word
+#          count — any count > 0 drops some class of proper-noun message.
+#
 # v2.7.0 CHANGES (SPEC-PREFERENCE-DISTILLATION-001 — plugin campaign):
 #   NEW  — astral_preferences tool: 5 actions (pending/approve/decline/
 #          withdraw/declare). The consent surface for H7-discovered and
@@ -264,7 +283,7 @@ logger = logging.getLogger("astral-memory")
 # Constants
 # ---------------------------------------------------------------------------
 
-_VERSION = "2.7.0"
+_VERSION = "2.7.1"
 _DEFAULT_SERVER_URL = "http://127.0.0.1:8090"
 _DEFAULT_DATA_DIR = "~/.astral"
 
@@ -1245,13 +1264,17 @@ class AstralCoreMemoryProvider(MemoryProvider):
         if not self._auto_capture or not self._ready():
             return
 
-        # v2.3.0 pre-filter: skip low-information turns. Under 8 combined
-        # words there is nothing for the extraction pipeline to keep, and
-        # ingesting them feeds noise into Dreamer episode generation even
-        # when the surprise gate rejects the memory itself.
+        # v2.7.1 (N-10a fix): the v2.3.0 8-word pre-filter is removed. It was
+        # added to shield Dreamer episode generation from noise, but short
+        # turns are often the highest-signal ones (proper nouns, answers,
+        # confirmations — "Mina the Hollower" is 3 words). Under
+        # SPEC-EPISODE-BOUNDARY-001 filtering is the server's job
+        # (SEC-ORD-1: redact → spool-append → noise → gate); a client-side
+        # word count punches holes in the raw-turn spool's completeness
+        # guarantee. Only genuinely empty turns are skipped.
         combined = f"{user_content} {assistant_content}"
-        if len(combined.split()) < 8:
-            logger.debug("sync_turn: skipped low-information turn (<8 words)")
+        if not combined.strip():
+            logger.debug("sync_turn: skipped empty turn")
             return
 
         sid = self._sid(session_id)
@@ -1357,7 +1380,11 @@ class AstralCoreMemoryProvider(MemoryProvider):
                     and messages[i + 1].get("role") == "assistant"):
                 user_text = str(messages[i].get("content", "") or "").strip()
                 asst_text = str(messages[i + 1].get("content", "") or "").strip()
-                if user_text and asst_text and len(user_text) > 20:
+                # v2.7.1 (N-10b fix): the `len(user_text) > 20` char gate is
+                # removed for the same reason as the sync_turn word filter —
+                # short user turns carry high-signal proper nouns and must
+                # reach the server-side pipeline. Non-empty is sufficient.
+                if user_text and asst_text:
                     pairs.append({
                         "user": user_text[:self._capture_max_chars],
                         "assistant": asst_text[:self._capture_max_chars],
