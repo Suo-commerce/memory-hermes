@@ -1,9 +1,23 @@
-# Generation Timestamp: 2026-08-11T01:30:00Z
-# Purpose: Hermes memory plugin — v2.7.1 removes client-side length filters
-#          (N-10a/N-10b) so short high-signal turns reach the server-side
-#          pipeline per SPEC-EPISODE-BOUNDARY-001 / SEC-ORD-1.
+# Generation Timestamp: 2026-08-12T09:00:00Z
+# Purpose: Hermes memory plugin — v2.7.2 stamps session_id on ingest and
+#          prefetch so the server's same-session echo filter (R-ECHO-1)
+#          actually has a predicate to match.
 #
 # astral-memory/__init__.py
+# v2.7.2 CHANGES (R-ECHO-1b — INCIDENT-BOTJARMO-NULLBRAIN-001 N-11):
+#   FIX  — sync_turn(): ingest payload now includes "session_id": sid
+#          alongside the existing source=hermes_{sid}. Stored memories
+#          previously carried NO session_id in metadata (only source), so
+#          the server's same-session echo filter compared against an
+#          absent field and silently no-op'd — prod evidence 2026-08-12:
+#          the morning's question echoed itself at 0.89 in prefetch as 4
+#          near-duplicate copies.
+#   FIX  — _do_prefetch(): augmented-prompt payload now includes
+#          "session_id" (same _sid() derivation as ingest — parity by
+#          construction, the two can never drift). Requires server with
+#          AugmentedPromptRequest.session_id (types.rs 2026-08-12);
+#          harmless extra field on older servers (serde ignores it).
+#
 # v2.7.1 CHANGES (INCIDENT-BOTJARMO-NULLBRAIN-001 N-10 — pre-filter removal):
 #   FIX  — sync_turn(): the v2.3.0 "<8 combined words" pre-filter is
 #          removed (N-10a). Short turns are often the highest-signal ones
@@ -283,7 +297,7 @@ logger = logging.getLogger("astral-memory")
 # Constants
 # ---------------------------------------------------------------------------
 
-_VERSION = "2.7.1"
+_VERSION = "2.7.2"
 _DEFAULT_SERVER_URL = "http://127.0.0.1:8090"
 _DEFAULT_DATA_DIR = "~/.astral"
 
@@ -1140,6 +1154,12 @@ class AstralCoreMemoryProvider(MemoryProvider):
             "query": query,
             "max_memories": self._max_recall,
         }
+        # v2.7.2 (R-ECHO-1b): tell the server whose session is asking so
+        # its same-session echo filter can exclude THIS session's own
+        # turns from the injected context (N-11: the question was echoing
+        # itself at 0.89). Same sid derivation as sync_turn ingest.
+        if session_id:
+            payload["session_id"] = session_id
         if self._min_similarity is not None:
             payload["min_similarity"] = self._min_similarity
 
@@ -1288,6 +1308,12 @@ class AstralCoreMemoryProvider(MemoryProvider):
                 "assistant_response": assistant_content[:self._capture_max_chars],
                 "source": f"hermes_{sid}" if sid else "hermes",
             }
+            # v2.7.2 (R-ECHO-1b): stamp the session id explicitly so stored
+            # memories carry metadata.session_id — the server-side
+            # same-session echo filter needs it. Same sid as `source`, so
+            # ingest and prefetch can never drift apart.
+            if sid:
+                payload["session_id"] = sid
             if ns:
                 payload["namespace"] = ns
                 logger.debug("sync_turn: writing to namespace '%s'", ns)
