@@ -1,7 +1,20 @@
-# Generation Timestamp: 2026-08-03T15:30:00Z
+# Generation Timestamp: 2026-08-17T09:10:00Z
+# Purpose: Tool schemas the LLM reads to decide when to call Astral Core tools —
+#          v2.8.0 teaches the agent to read provenance tags on recall results
+#          (SPEC-PROVENANCE-AWARE-RECALL-001 P-2) and aligns the recall limit
+#          default with the plugin (5 → 8).
 """
 Tool schemas — what the LLM reads to decide when to call Astral Core tools.
-Version: 2.7.0
+Version: 2.8.0
+
+v2.8.0 CHANGES (SPEC-PROVENANCE-AWARE-RECALL-001 P-2, SPEC-DYAD-DISTILLATION-001 A2-7/A3):
+  CHG  — ASTRAL_RECALL description now explains the "provenance" tag on
+         each result and how to weigh it: [user] ground truth, [dyad]
+         answer anchored to a user question, [assistant] distilled belief
+         (faithful, not verified), [diagnostic] notes about the memory
+         system's own behaviour. The server ranks on provenance already;
+         this makes the agent's *use* of a recalled memory match its trust.
+  CHG  — ASTRAL_RECALL `limit` default text 5 → 8 (matches plugin v2.8.0).
 
 These are returned by AstralCoreMemoryProvider.get_tool_schemas() and
 injected into the Hermes tool registry automatically.  The LLM sees
@@ -26,18 +39,32 @@ ASTRAL_RECALL = {
     "description": (
         "Search your long-term memory for relevant information. Use this before "
         "answering questions about the user's preferences, past decisions, project "
-        "details, or anything discussed in previous sessions."
+        "details, or anything discussed in previous sessions. "
+        "Results are ranked by relevance AND provenance, and each carries a "
+        "'provenance' tag telling you how much to trust it: [user] = the user's "
+        "own statement (ground truth about their world — prefer this when it "
+        "conflicts); [dyad] re: <intent> = an answer you gave to that user "
+        "question (good for 'what did we discuss'); [assistant] = distilled "
+        "belief you produced earlier — faithful to what was said, NOT verified, "
+        "so re-check facts that matter; [diagnostic] = notes about the memory "
+        "system's own behaviour on a named item (rarely what the user wants "
+        "unless they ask about the memory system itself); untagged = legacy "
+        "memory of unknown provenance. Include proper nouns in the query when "
+        "you have them — lexical matches are retrieved alongside semantic ones."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "query": {
                 "type": "string",
-                "description": "Natural language search query",
+                "description": (
+                    "Natural language search query. Proper nouns and specific "
+                    "terms help (hybrid lexical + semantic retrieval)."
+                ),
             },
             "limit": {
                 "type": "integer",
-                "description": "Maximum results to return (default: 5)",
+                "description": "Maximum results to return (default: 8)",
             },
             "namespace": {
                 "type": "string",

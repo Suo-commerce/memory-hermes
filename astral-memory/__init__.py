@@ -1,7 +1,35 @@
-# Generation Timestamp: 2026-08-12T09:00:00Z
-# Purpose: Hermes memory plugin — v2.7.2 stamps session_id on ingest and
-#          prefetch so the server's same-session echo filter (R-ECHO-1)
-#          actually has a predicate to match.
+# Generation Timestamp: 2026-08-17T09:00:00Z
+# Purpose: Hermes memory plugin — v2.8.0 renders read-side provenance
+#          (SPEC-PROVENANCE-AWARE-RECALL-001 P-2), raises the per-turn
+#          recall budget to match the hybrid pipeline, aligns the capture
+#          cap with the server's dyad budget, and adds the explicit
+#          session_scope field (SPEC-DYAD-DISTILLATION-001 A3-3).
+#
+# v2.8.0 CHANGES (P-2 provenance rendering + A3-3 session_scope):
+#   NEW  — astral_recall results carry a compact "provenance" tag built
+#          from the server's source_role/content_class/user_intent
+#          (top-level since R-5, also present in metadata): "[dyad] re: …",
+#          "[assistant]", "[user]", "[diagnostic]"; legacy memories carry
+#          no tag. A "provenance_legend" is attached once per response so
+#          the agent applies "faithful, not factual": [assistant] is
+#          distilled belief, [user] is ground truth, [dyad] is answer
+#          anchored to a user question. Auto-prefetch context is rendered
+#          server-side and unchanged here.
+#   NEW  — config `session_scope` (optional; "verification" only). When
+#          set, every ingest payload carries "session_scope" so the server
+#          can down-rank verification-session memories (A3-3, explicit
+#          client-set — the server does NOT infer scope from session ids).
+#          Set it in astral-memory.json for a Hermes instance used to run
+#          fixtures/canaries; leave unset for normal use.
+#   CHG  — default max_recall_memories 5 → 8. With hybrid BM25+cosine
+#          retrieval and provenance ranking (2026-08-17) the pool is worth
+#          reading; 5 truncated payload behind stubs in Gate 2 (pool =
+#          12 × max_memories). Existing astral-memory.json values win.
+#   CHG  — default capture_max_chars 8000 → 12000 to match the server's
+#          dyad_max_chars (SPEC-DYAD-DISTILLATION-001 §3.3). Previously the
+#          plugin truncated long assistant answers before the server's
+#          head+tail truncation could run, silently dropping the tail of
+#          F-3/F-11-class exchanges without the [TRUNCATED] marker.
 #
 # astral-memory/__init__.py
 # v2.7.2 CHANGES (R-ECHO-1b — INCIDENT-BOTJARMO-NULLBRAIN-001 N-11):
@@ -297,8 +325,39 @@ logger = logging.getLogger("astral-memory")
 # Constants
 # ---------------------------------------------------------------------------
 
-_VERSION = "2.7.2"
+_VERSION = "2.8.0"
 _DEFAULT_SERVER_URL = "http://127.0.0.1:8090"
+
+# v2.8.0 (P-2): how to read a provenance tag. Attached once per recall
+# response when at least one result carries provenance.
+_PROVENANCE_LEGEND = (
+    "[user] = the user's own statement (ground truth about their world); "
+    "[dyad] = an answer anchored to a user question ('re:' shows the intent); "
+    "[assistant] = distilled belief the assistant produced — faithful to what "
+    "was said, not verified; [diagnostic] = notes about the memory system's "
+    "own behaviour on a named item (usually not what the user is asking for); "
+    "untagged = legacy memory of unknown provenance."
+)
+
+
+def _provenance_tag(result: Any) -> str:
+    """Build a compact provenance tag from a search result, or '' for legacy."""
+    if not isinstance(result, dict):
+        return ""
+    meta = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+    role = result.get("source_role") or meta.get("source_role") or ""
+    cls = result.get("content_class") or meta.get("content_class") or ""
+    intent = result.get("user_intent") or meta.get("user_intent") or ""
+    role = str(role).lower(); cls = str(cls).lower()
+    if not role or role == "unknown":
+        return ""
+    if cls == "diagnostic":
+        return "[diagnostic]"
+    if role == "dyad":
+        return f"[dyad] re: {str(intent)[:80]}" if intent else "[dyad]"
+    if role in ("assistant", "user"):
+        return f"[{role}]"
+    return ""
 _DEFAULT_DATA_DIR = "~/.astral"
 
 _CONNECT_TIMEOUT = 3.0
@@ -585,10 +644,11 @@ class AstralCoreMemoryProvider(MemoryProvider):
         # Config
         self._auto_capture: bool = True
         self._auto_recall: bool = True
-        self._max_recall: int = 5
-        self._capture_max_chars: int = 8000
+        self._max_recall: int = 8          # v2.8.0: was 5
+        self._capture_max_chars: int = 12000  # v2.8.0: match dyad_max_chars
         self._briefing_on_start: bool = False
         self._min_similarity: Optional[float] = None
+        self._session_scope: Optional[str] = None  # v2.8.0 (A3-3): "verification" or None
         self._data_dir: str = _DEFAULT_DATA_DIR
         self._api_token: str = ""  # v2.5.0: Bearer auth
 
@@ -704,6 +764,15 @@ class AstralCoreMemoryProvider(MemoryProvider):
             except (TypeError, ValueError):
                 self._min_similarity = None
         self._data_dir = cfg.get("data_dir", self._data_dir)
+
+        # v2.8.0 (A3-3): explicit session scope. Only "verification" is
+        # meaningful; anything else is ignored so a typo can't invent a
+        # scope the server doesn't know.
+        scope = str(cfg.get("session_scope", "") or "").strip().lower()
+        self._session_scope = scope if scope == "verification" else None
+        if self._session_scope:
+            logger.info("astral-memory: session_scope=%s (ingest will be tagged)",
+                        self._session_scope)
 
         # §8.1: load default_namespace. Empty string or absent →
         # cross-namespace mode (no namespace sent on writes/reads).
@@ -845,10 +914,24 @@ class AstralCoreMemoryProvider(MemoryProvider):
             if ns:
                 payload["namespace_filter"] = ns
 
-        return json.dumps(
-            self._http.post("/v1/memory/search", payload),
-            indent=2, default=str,
-        )
+        data = self._http.post("/v1/memory/search", payload)
+        # v2.8.0 (P-2): render provenance so the agent can weigh what it
+        # recalls. Server emits source_role/content_class/user_intent as
+        # top-level fields (R-5) and in metadata; legacy memories have none.
+        try:
+            results = data.get("results") if isinstance(data, dict) else None
+            if isinstance(results, list):
+                tagged = 0
+                for r in results:
+                    tag = _provenance_tag(r)
+                    if tag:
+                        r["provenance"] = tag
+                        tagged += 1
+                if tagged:
+                    data["provenance_legend"] = _PROVENANCE_LEGEND
+        except Exception as e:  # never let rendering break recall
+            logger.debug("provenance rendering skipped: %s", e)
+        return json.dumps(data, indent=2, default=str)
 
     def _tool_store(self, args: dict, session_id: str) -> str:
         text = args.get("text", "")
@@ -1317,6 +1400,9 @@ class AstralCoreMemoryProvider(MemoryProvider):
             if ns:
                 payload["namespace"] = ns
                 logger.debug("sync_turn: writing to namespace '%s'", ns)
+            # v2.8.0 (A3-3): explicit, client-set verification scope.
+            if self._session_scope:
+                payload["session_scope"] = self._session_scope
             result = self._http.post("/v1/memory/ingest", payload)
             if "error" in result:
                 logger.debug("sync_turn failed (non-fatal): %s", result["error"])
@@ -1656,7 +1742,16 @@ class AstralCoreMemoryProvider(MemoryProvider):
             {
                 "key": "max_recall_memories",
                 "description": "Maximum memories to inject per turn",
-                "default": "5",
+                "default": "8",
+            },
+            {
+                "key": "session_scope",
+                "description": (
+                    "Optional. Set to 'verification' for a Hermes instance used "
+                    "to run fixtures/canaries; ingested memories are tagged so "
+                    "the server can down-rank them (A3-3). Leave empty otherwise."
+                ),
+                "default": "",
             },
             {
                 "key": "briefing_on_start",
@@ -1689,7 +1784,7 @@ class AstralCoreMemoryProvider(MemoryProvider):
             try:
                 coerced["max_recall_memories"] = int(coerced["max_recall_memories"])
             except (TypeError, ValueError):
-                coerced["max_recall_memories"] = 5
+                coerced["max_recall_memories"] = 8
 
         if "default_namespace" in coerced:
             ns = str(coerced["default_namespace"] or "").strip()
