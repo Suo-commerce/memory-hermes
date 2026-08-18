@@ -1,29 +1,9 @@
-# Generation Timestamp: 2026-08-18T22:10:00Z
-# Purpose: Hermes memory plugin — v2.9.0 adds RT-13 Layer A response-
-#          fidelity feedback (SPEC-REMEMBERING-TOUCH-001 Amendment A5 §2):
-#          A1 evidence-use on the same turn and A2 next-turn continuation/
-#          correction, POSTed as id-only signals to /v1/memories/fidelity.
-#          v2.8.0 rendered read-side provenance
+# Generation Timestamp: 2026-08-17T09:00:00Z
+# Purpose: Hermes memory plugin — v2.8.0 renders read-side provenance
 #          (SPEC-PROVENANCE-AWARE-RECALL-001 P-2), raises the per-turn
 #          recall budget to match the hybrid pipeline, aligns the capture
 #          cap with the server's dyad budget, and adds the explicit
 #          session_scope field (SPEC-DYAD-DISTILLATION-001 A3-3).
-#
-# v2.9.0 CHANGES (RT-13 Layer A — Amendment A5 §2, F2):
-#   NEW  — fidelity.py (F1) soft-imported; two pure classifiers, no LLM.
-#   NEW  — _served_texts[sid]: id→text captured from astral_recall results
-#          and (when the server returns per-memory text) from prefetch.
-#          A1 needs text; ids without text are UNSCORED for A1, still
-#          covered by A2.
-#   NEW  — sync_turn(): snapshots served ids for the turn, runs A1 against
-#          assistant_content, POSTs signals (pool, non-fatal), stashes
-#          {turn, served, prev_user} in _fidelity_pending[sid] for A2.
-#   NEW  — on_turn_start(): if pending, runs A2(message vs prev_user),
-#          POSTs, clears. Fires before the consolidation nudge.
-#   NEW  — config key `fidelity` (default true). Plugin-side gate only —
-#          the server's response_fidelity.observation_mode is the real
-#          safety and ships ON. Payload never contains memory text.
-#   FIX  — version 2.8.0 -> 2.9.0 (manifest bumped in step).
 #
 # v2.8.0 CHANGES (P-2 provenance rendering + A3-3 session_scope):
 #   NEW  — astral_recall results carry a compact "provenance" tag built
@@ -339,20 +319,13 @@ from agent.memory_provider import MemoryProvider
 
 from . import schemas
 
-# v2.9.0 (RT-13 F2): soft import — the provider must keep working if the
-# fidelity module is missing from an install (older copy, partial deploy).
-try:  # pragma: no cover
-    from . import fidelity as _fidelity
-except Exception:  # noqa: BLE001
-    _fidelity = None
-
 logger = logging.getLogger("astral-memory")
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-_VERSION = "2.9.0"
+_VERSION = "2.8.0"
 _DEFAULT_SERVER_URL = "http://127.0.0.1:8090"
 
 # v2.8.0 (P-2): how to read a provenance tag. Attached once per recall
@@ -654,14 +627,6 @@ class AstralCoreMemoryProvider(MemoryProvider):
         # context_manifest provenance on delegation-result ingests.
         self._recalled_ids: Dict[str, List[str]] = {}
 
-        # v2.9.0 (RT-13 F2): id→text for memories served this session, so
-        # A1 can score evidence-use. Bounded per session (last 64).
-        self._served_texts: Dict[str, Dict[str, str]] = {}
-        # v2.9.0 (RT-13 F2): per-session pending A2 context, written by
-        # sync_turn, consumed by the next on_turn_start.
-        # {sid: {"turn": int, "served": [ids], "prev_user": str}}
-        self._fidelity_pending: Dict[str, Dict[str, Any]] = {}
-
         # Namespace state (SPEC-NAMESPACE-001 §9.1).
         # _config_namespace is loaded from `default_namespace` in config.
         # _active_namespace is set per-session via the astral_namespace tool
@@ -684,7 +649,6 @@ class AstralCoreMemoryProvider(MemoryProvider):
         self._briefing_on_start: bool = False
         self._min_similarity: Optional[float] = None
         self._session_scope: Optional[str] = None  # v2.8.0 (A3-3): "verification" or None
-        self._fidelity_enabled: bool = True  # v2.9.0 (RT-13 F2)
         self._data_dir: str = _DEFAULT_DATA_DIR
         self._api_token: str = ""  # v2.5.0: Bearer auth
 
@@ -804,13 +768,6 @@ class AstralCoreMemoryProvider(MemoryProvider):
         # v2.8.0 (A3-3): explicit session scope. Only "verification" is
         # meaningful; anything else is ignored so a typo can't invent a
         # scope the server doesn't know.
-        # v2.9.0 (RT-13 F2): plugin-side gate. Server observation mode is
-        # the safety; this only lets an operator silence the POSTs.
-        self._fidelity_enabled = bool(cfg.get("fidelity", self._fidelity_enabled))
-        if _fidelity is None and self._fidelity_enabled:
-            logger.info("astral-memory: fidelity module absent; RT-13 signals disabled")
-            self._fidelity_enabled = False
-
         scope = str(cfg.get("session_scope", "") or "").strip().lower()
         self._session_scope = scope if scope == "verification" else None
         if self._session_scope:
@@ -865,100 +822,6 @@ class AstralCoreMemoryProvider(MemoryProvider):
         except RuntimeError:
             # Pool already shut down mid-turn.
             pass
-
-    # ------------------------------------------------------------------
-    # RT-13 Layer A — response fidelity (v2.9.0, Amendment A5 §2)
-    # ------------------------------------------------------------------
-
-    def _remember_served(self, session_id: str, objs: Any) -> None:
-        """Capture id→text for served memories (bounded, non-fatal)."""
-        try:
-            sid = self._sid(session_id)
-            with self._state_lock:
-                bucket = self._served_texts.setdefault(sid, {})
-                for o in objs or []:
-                    if not isinstance(o, dict):
-                        continue
-                    mid = o.get("id") or o.get("memory_id")
-                    if not mid:
-                        continue
-                    text = o.get("text") or o.get("content") or o.get("summary") or ""
-                    bucket[str(mid)] = str(text)[:2000]
-                if len(bucket) > 64:
-                    for k in list(bucket)[:-64]:
-                        bucket.pop(k, None)
-        except Exception as e:  # noqa: BLE001
-            logger.debug("fidelity: _remember_served skipped: %s", e)
-
-    def _fidelity_post(self, sid: str, turn: int, signals: list) -> None:
-        """Build and POST a fidelity batch on the pool. Never raises."""
-        if not signals or _fidelity is None or not self._ready():
-            return
-        payload = _fidelity.build_payload(
-            sid, turn, signals, source=f"hermes-{_VERSION}",
-            cosine_available=False,
-        )
-        if not payload:
-            return
-
-        def _send() -> None:
-            r = self._http.post("/v1/memories/fidelity", payload)
-            if "error" in r:
-                logger.debug("fidelity POST failed (non-fatal): %s", r["error"])
-            else:
-                logger.debug("fidelity: applied=%s logged=%s obs=%s rejected=%s",
-                             r.get("applied"), r.get("logged"),
-                             r.get("observation_mode"), len(r.get("rejected") or []))
-
-        self._submit(_send)
-
-    def _fidelity_after_turn(self, sid: str, user_content: str,
-                             assistant_content: str) -> None:
-        """A1 (evidence-use) for the turn just completed + stash A2 context."""
-        if not self._fidelity_enabled or _fidelity is None:
-            return
-        try:
-            with self._state_lock:
-                served_ids = list(self._recalled_ids.get(sid, []))
-                texts = dict(self._served_texts.get(sid, {}))
-                turn = int(self._turn_counts.get(sid, 0))
-                # Explicit astral_recall results are served too, even if
-                # the server's augmented-prompt didn't list them.
-                for mid in texts:
-                    if mid not in served_ids:
-                        served_ids.append(mid)
-                served_ids = served_ids[:32]
-                self._fidelity_pending[sid] = {
-                    "turn": turn,
-                    "served": served_ids,
-                    "prev_user": (user_content or "")[:2000],
-                }
-            if not served_ids:
-                return
-            served = [_fidelity.ServedMemory(i, texts.get(i, "")) for i in served_ids]
-            a1 = _fidelity.a1_evidence_use(served, assistant_content or "")
-            logger.debug("fidelity A1 turn=%s served=%d verdicts=%s",
-                         turn, len(served_ids), a1.per_memory)
-            self._fidelity_post(sid, turn, a1.signals)
-        except Exception as e:  # noqa: BLE001 — never let feedback kill a turn
-            logger.debug("fidelity A1 skipped: %s", e)
-
-    def _fidelity_next_turn(self, sid: str, message: str) -> None:
-        """A2 (continuation/correction) for the previous turn's served ids."""
-        if not self._fidelity_enabled or _fidelity is None:
-            return
-        try:
-            with self._state_lock:
-                pending = self._fidelity_pending.pop(sid, None)
-            if not pending or not pending.get("served"):
-                return
-            a2 = _fidelity.a2_next_turn(pending["served"], message or "",
-                                        pending.get("prev_user", ""))
-            logger.debug("fidelity A2 turn=%s verdict=%s reason=%s",
-                         pending["turn"], a2.verdict, a2.reason)
-            self._fidelity_post(sid, int(pending["turn"]), a2.signals)
-        except Exception as e:  # noqa: BLE001
-            logger.debug("fidelity A2 skipped: %s", e)
 
     def _ready(self) -> bool:
         return self._http is not None
@@ -1066,9 +929,6 @@ class AstralCoreMemoryProvider(MemoryProvider):
                         tagged += 1
                 if tagged:
                     data["provenance_legend"] = _PROVENANCE_LEGEND
-                # v2.9.0 (RT-13 F2): remember id→text so A1 can score
-                # evidence-use when this turn is synced.
-                self._remember_served(session_id, results)
         except Exception as e:  # never let rendering break recall
             logger.debug("provenance rendering skipped: %s", e)
         return json.dumps(data, indent=2, default=str)
@@ -1419,14 +1279,6 @@ class AstralCoreMemoryProvider(MemoryProvider):
                 self._recalled_ids[session_id] = [
                     str(i) for i in ids if i
                 ][:32]
-        # v2.9.0 (RT-13 F2): if the server also returns per-memory objects
-        # (any of memories/results/items with id+text), keep the text for
-        # A1. Older servers return ids only → those stay UNSCORED for A1.
-        for key in ("memories", "results", "items"):
-            objs = data.get(key)
-            if isinstance(objs, list) and objs:
-                self._remember_served(session_id, objs)
-                break
 
         # Optional: prepend the briefing card on the first recall of a session.
         if self._briefing_on_start:
@@ -1533,11 +1385,6 @@ class AstralCoreMemoryProvider(MemoryProvider):
         # §10.1: resolve namespace for auto-capture.
         ns = self._resolve_namespace()
 
-        # v2.9.0 (RT-13 F2): fidelity Layer A, same turn. Snapshot the
-        # served ids NOW (prefetch for the next turn will overwrite them),
-        # score A1 against the assistant text, and stash the A2 context.
-        self._fidelity_after_turn(sid, user_content, assistant_content)
-
         def _sync() -> None:
             payload: Dict[str, Any] = {
                 "user_message": user_content[:self._capture_max_chars],
@@ -1570,10 +1417,6 @@ class AstralCoreMemoryProvider(MemoryProvider):
         sid = self._sid(kwargs.get("session_id", ""))
         with self._state_lock:
             self._turn_counts[sid] = turn_number
-
-        # v2.9.0 (RT-13 F2): fidelity Layer A2 — the user's next message
-        # tells us whether the previous response landed.
-        self._fidelity_next_turn(sid, message)
 
         if (_CONSOLIDATE_EVERY_N_TURNS
                 and turn_number > 0
@@ -1909,16 +1752,6 @@ class AstralCoreMemoryProvider(MemoryProvider):
                     "the server can down-rank them (A3-3). Leave empty otherwise."
                 ),
                 "default": "",
-            },
-            {
-                "key": "fidelity",
-                "description": (
-                    "Send RT-13 response-fidelity signals (ids only, no text) "
-                    "to the server after each turn. The server decides whether "
-                    "to apply or only log them (observation mode)."
-                ),
-                "default": "true",
-                "choices": ["true", "false"],
             },
             {
                 "key": "briefing_on_start",

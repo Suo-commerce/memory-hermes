@@ -1,6 +1,4 @@
-# Generation Timestamp: 2026-08-18T22:10:00Z
-# v2.9.0: RT-13 Layer A fidelity feedback (fidelity.py + hooks). No new
-#         tools; provides_tools/hooks unchanged. Bumped in step with _VERSION.
+# Generation Timestamp: 2026-08-17T09:15:00Z
 # Purpose: Hermes memory provider manifest — v2.8.0 brings the manifest back in
 #          step with the code (it sat at 2.4.0 through 2.5–2.7), declares the
 #          astral_preferences tool that schemas.py has exposed since 2.7.0, and
@@ -86,7 +84,7 @@
 #   hermes config set memory.provider astral_memory
 
 name: astral-memory
-version: 2.9.0
+version: 2.8.0
 
 # See header: skips the 8192-byte source scan for user-installed plugins.
 kind: exclusive
