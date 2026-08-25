@@ -1,6 +1,12 @@
-# Generation Timestamp: 2026-07-30T20:00:00Z
+# Generation Timestamp: 2026-08-25T12:30:00Z
+# Purpose: Contract tests for the Hermes memory plugin; v1.2.0 retargets the
+#          astral_store tests to /v1/memory/add and pins STORE-1 (explicit
+#          stores must reach the server verbatim, never via the extractor).
 #
 # tests/test_provider_contract.py
+# v1.2.0 — STORE-1: astral_store -> /v1/memory/add (plugin v2.9.1).
+#          FIX: provider fixture's _HttpClient stub now accepts the v2.5.0
+#          Bearer-auth kwargs; the suite had been erroring since then.
 # v1.1.0 — added namespace tests (SPEC-NAMESPACE-001).
 #
 # WHY THIS FILE EXISTS
@@ -144,6 +150,9 @@ class _FakeHttp:
             return {"context_block": f"CONTEXT<{q}>"}
         if path == "/v1/memory/search":
             return {"results": []}
+        if path == "/v1/memory/add":
+            return {"stored": True, "memory_id": "mem-fake-0001",
+                    "total_memories": 43}
         return {"ok": True}
 
     def delete(self, path: str, timeout: float = 0) -> dict:
@@ -175,7 +184,13 @@ def http() -> _FakeHttp:
 @pytest.fixture
 def provider(monkeypatch, tmp_path, http):
     """An initialized provider wired to a fake transport."""
-    monkeypatch.setattr(astral_memory, "_HttpClient", lambda url: http)
+    # v1.2.0: _HttpClient has taken api_token= / token_loader= since plugin
+    # v2.5.0 (Bearer auth). The old `lambda url:` stub raised TypeError inside
+    # initialize(), which errored every fixture-backed test — the guard had
+    # been silently disarmed. Accept and ignore any keyword arguments.
+    monkeypatch.setattr(
+        astral_memory, "_HttpClient", lambda url, *a, **kw: http,
+    )
     p = AstralCoreMemoryProvider()
     p.initialize("session-alpha", hermes_home=str(tmp_path))
     yield p
@@ -353,7 +368,7 @@ def test_unhealthy_server_yields_empty_prompt_block(monkeypatch, tmp_path):
         def health(self):
             return None
 
-    monkeypatch.setattr(astral_memory, "_HttpClient", lambda url: _Dead())
+    monkeypatch.setattr(astral_memory, "_HttpClient", lambda url, *a, **kw: _Dead())
     p = AstralCoreMemoryProvider()
     p.initialize("s", hermes_home=str(tmp_path))
     assert p.system_prompt_block() == ""
@@ -533,7 +548,7 @@ def test_config_schema_keys_are_read_by_load_config(monkeypatch, tmp_path, http)
         "briefing_on_start": True,
         "data_dir": "/tmp/astral-corpus",
     }))
-    monkeypatch.setattr(astral_memory, "_HttpClient", lambda url: http)
+    monkeypatch.setattr(astral_memory, "_HttpClient", lambda url, *a, **kw: http)
     p = AstralCoreMemoryProvider()
     p.initialize("s", hermes_home=str(tmp_path))
 
@@ -548,7 +563,7 @@ def test_config_schema_keys_are_read_by_load_config(monkeypatch, tmp_path, http)
 
 def test_auto_recall_disabled_short_circuits(monkeypatch, tmp_path, http):
     (tmp_path / "astral-memory.json").write_text(json.dumps({"auto_recall": False}))
-    monkeypatch.setattr(astral_memory, "_HttpClient", lambda url: http)
+    monkeypatch.setattr(astral_memory, "_HttpClient", lambda url, *a, **kw: http)
     p = AstralCoreMemoryProvider()
     p.initialize("s", hermes_home=str(tmp_path))
     assert p.prefetch("q", session_id="s") == ""
@@ -574,7 +589,7 @@ def test_dead_server_never_raises(monkeypatch, tmp_path):
         def delete(self, path, timeout=0):
             return {"error": "Memory server not reachable"}
 
-    monkeypatch.setattr(astral_memory, "_HttpClient", lambda url: _Dead())
+    monkeypatch.setattr(astral_memory, "_HttpClient", lambda url, *a, **kw: _Dead())
     p = AstralCoreMemoryProvider()
     p.initialize("s", hermes_home=str(tmp_path))
 
@@ -756,7 +771,7 @@ def test_store_includes_namespace_when_active(provider, http):
         "astral_namespace", {"action": "set", "namespace": "tree-guardians"},
     )
     provider.handle_tool_call("astral_store", {"text": "remember this"})
-    body = http.payload_for("/v1/memory/ingest")
+    body = http.payload_for("/v1/memory/add")
     assert body["namespace"] == "tree-guardians"
 
 
@@ -767,14 +782,87 @@ def test_store_per_call_override(provider, http):
     provider.handle_tool_call(
         "astral_store", {"text": "remember this", "namespace": "astral-core"},
     )
-    body = http.payload_for("/v1/memory/ingest")
+    body = http.payload_for("/v1/memory/add")
     assert body["namespace"] == "astral-core"
 
 
 def test_store_omits_namespace_when_inactive(provider, http):
     provider.handle_tool_call("astral_store", {"text": "remember this"})
-    body = http.payload_for("/v1/memory/ingest")
+    body = http.payload_for("/v1/memory/add")
     assert "namespace" not in body
+
+
+# ---------------------------------------------------------------------------
+# STORE-1 regression pins (plugin v2.9.1)
+#
+#   Before v2.9.1 astral_store POSTed a synthetic dialogue to
+#   /v1/memory/ingest. The server ran dyad extraction on it and persisted the
+#   Dreamer's paraphrase instead of the caller's text (Finnish came back as
+#   English summaries; segments_stored reported 0). These tests make that
+#   route a hard failure.
+# ---------------------------------------------------------------------------
+
+_STORE_TEXT_FI = "Sovittu: komponenttiarkkitehtuuri säilyy, mikropalvelut eivät."
+
+
+def test_store_uses_direct_add_not_ingest(provider, http):
+    provider.handle_tool_call("astral_store", {"text": _STORE_TEXT_FI})
+    _drain(provider)
+    posts = http.paths("POST")
+    assert "/v1/memory/add" in posts
+    assert "/v1/memory/ingest" not in posts, (
+        "astral_store must never route through the dyad extractor"
+    )
+
+
+def test_store_sends_text_verbatim_with_category_and_source(provider, http):
+    provider.handle_tool_call(
+        "astral_store", {"text": f"  {_STORE_TEXT_FI}  ", "category": "decision"},
+    )
+    body = http.payload_for("/v1/memory/add")
+    assert body["text"] == _STORE_TEXT_FI          # trimmed, otherwise untouched
+    assert body["category"] == "decision"
+    assert body["source"] == "hermes_explicit_session-alpha"
+    assert body["metadata"]["category"] == "decision"
+    assert body["metadata"]["source"] == "hermes_explicit"
+    # The old synthetic-dialogue shape must be gone entirely.
+    assert "user_message" not in body
+    assert "assistant_response" not in body
+
+
+def test_store_default_category_is_fact(provider, http):
+    provider.handle_tool_call("astral_store", {"text": "plain note"})
+    body = http.payload_for("/v1/memory/add")
+    assert body["category"] == "fact"
+    assert body["metadata"]["category"] == "fact"
+
+
+def test_store_response_is_normalised(provider, http):
+    out = json.loads(provider.handle_tool_call(
+        "astral_store", {"text": _STORE_TEXT_FI, "category": "decision"},
+    ))
+    assert out["success"] is True
+    assert out["id"] == "mem-fake-0001"
+    assert out["text"] == _STORE_TEXT_FI
+    assert out["category"] == "decision"
+    assert out["namespace"] is None          # nothing active in this fixture
+    assert out["total_memories"] == 43
+    assert "segments_stored" not in out      # old ingest counter is gone
+
+
+def test_store_surfaces_server_error(provider, http, monkeypatch):
+    def _post(path, payload=None, timeout=0):
+        http.calls.append(("POST", path, payload))
+        return {"error": "namespace rejected"}
+    monkeypatch.setattr(http, "post", _post)
+    out = json.loads(provider.handle_tool_call("astral_store", {"text": "x"}))
+    assert out == {"error": "namespace rejected"}
+
+
+def test_store_rejects_empty_text(provider, http):
+    out = json.loads(provider.handle_tool_call("astral_store", {"text": "   "}))
+    assert out == {"error": "text is required"}
+    assert "/v1/memory/add" not in http.paths("POST")
 
 
 def test_session_switch_resets_namespace(provider, http):
@@ -793,7 +881,7 @@ def test_config_default_namespace_loaded(monkeypatch, tmp_path, http):
     (tmp_path / "astral-memory.json").write_text(json.dumps({
         "default_namespace": "astral-core",
     }))
-    monkeypatch.setattr(astral_memory, "_HttpClient", lambda url: http)
+    monkeypatch.setattr(astral_memory, "_HttpClient", lambda url, *a, **kw: http)
     p = AstralCoreMemoryProvider()
     p.initialize("s", hermes_home=str(tmp_path))
     assert p._config_namespace == "astral-core"
@@ -804,7 +892,7 @@ def test_config_default_namespace_loaded(monkeypatch, tmp_path, http):
 
 def test_config_without_default_namespace(monkeypatch, tmp_path, http):
     """No default_namespace → cross-namespace mode."""
-    monkeypatch.setattr(astral_memory, "_HttpClient", lambda url: http)
+    monkeypatch.setattr(astral_memory, "_HttpClient", lambda url, *a, **kw: http)
     p = AstralCoreMemoryProvider()
     p.initialize("s", hermes_home=str(tmp_path))
     assert p._config_namespace == ""
@@ -817,7 +905,7 @@ def test_config_invalid_namespace_ignored(monkeypatch, tmp_path, http, caplog):
     (tmp_path / "astral-memory.json").write_text(json.dumps({
         "default_namespace": "INVALID UPPER",
     }))
-    monkeypatch.setattr(astral_memory, "_HttpClient", lambda url: http)
+    monkeypatch.setattr(astral_memory, "_HttpClient", lambda url, *a, **kw: http)
     with caplog.at_level("WARNING", logger="astral-memory"):
         p = AstralCoreMemoryProvider()
         p.initialize("s", hermes_home=str(tmp_path))
@@ -838,7 +926,7 @@ def test_server_without_namespace_support_omits_params(monkeypatch, tmp_path):
                 # No namespace_enabled field.
             }
 
-    monkeypatch.setattr(astral_memory, "_HttpClient", lambda url: _NoNs())
+    monkeypatch.setattr(astral_memory, "_HttpClient", lambda url, *a, **kw: _NoNs())
     p = AstralCoreMemoryProvider()
     p.initialize("s", hermes_home=str(tmp_path))
 

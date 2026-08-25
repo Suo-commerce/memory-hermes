@@ -1,6 +1,8 @@
-# Generation Timestamp: 2026-08-18T22:10:00Z
-# v2.9.0: RT-13 Layer A fidelity feedback (fidelity.py + hooks). No new
-#         tools; provides_tools/hooks unchanged. Bumped in step with _VERSION.
+# Generation Timestamp: 2026-08-25T12:45:00Z
+# Purpose: Hermes memory provider manifest — v2.9.1 tracks the STORE-1 fix
+#          (astral_store now writes verbatim via /v1/memory/add). No new
+#          tools; provides_tools/hooks unchanged. Bumped in step with _VERSION.
+# v2.9.0: RT-13 Layer A fidelity feedback (fidelity.py + hooks).
 # Purpose: Hermes memory provider manifest — v2.8.0 brings the manifest back in
 #          step with the code (it sat at 2.4.0 through 2.5–2.7), declares the
 #          astral_preferences tool that schemas.py has exposed since 2.7.0, and
@@ -86,14 +88,15 @@
 #   hermes config set memory.provider astral_memory
 
 name: astral-memory
-version: 2.9.0
+version: 2.9.1
 
 # See header: skips the 8192-byte source scan for user-installed plugins.
 kind: exclusive
 
 description: >
-  Offline-first persistent memory with surprise-gated learning, dyad
-  extraction (answers stored, not just questions), hybrid lexical+semantic
+  Offline-first persistent memory with surprise-gated learning, verbatim
+  explicit stores (astral_store), dyad extraction (answers stored, not just
+  questions), hybrid lexical+semantic
   retrieval, in-process multilingual cross-encoder reranking, provenance-
   tagged recall ([user]/[dyad]/[assistant]/[diagnostic]), HyDE query
   expansion, session diary, and fleet sync. No API keys required. The only
