@@ -1,13 +1,30 @@
-# Generation Timestamp: 2026-08-18T22:10:00Z
-# Purpose: Hermes memory plugin — v2.9.0 adds RT-13 Layer A response-
-#          fidelity feedback (SPEC-REMEMBERING-TOUCH-001 Amendment A5 §2):
-#          A1 evidence-use on the same turn and A2 next-turn continuation/
-#          correction, POSTed as id-only signals to /v1/memories/fidelity.
-#          v2.8.0 rendered read-side provenance
-#          (SPEC-PROVENANCE-AWARE-RECALL-001 P-2), raises the per-turn
-#          recall budget to match the hybrid pipeline, aligns the capture
-#          cap with the server's dyad budget, and adds the explicit
-#          session_scope field (SPEC-DYAD-DISTILLATION-001 A3-3).
+# Generation Timestamp: 2026-08-25T12:00:00Z
+# Purpose: Hermes memory plugin — v2.9.1 routes astral_store to the direct
+#          /v1/memory/add endpoint so explicit stores land verbatim (no
+#          dyad extraction, no surprise gate, category + namespace as real
+#          fields); v2.9.0 added RT-13 Layer A response-fidelity feedback
+#          (SPEC-REMEMBERING-TOUCH-001 Amendment A5 §2).
+#
+# v2.9.1 CHANGES (STORE-1 — explicit store bypasses the extractor):
+#   FIX  — _tool_store POSTed a synthetic dialogue ({user_message: text,
+#          assistant_response: "Stored as <category>."}) to
+#          /v1/memory/ingest. The server ran dyad extraction on it and
+#          persisted the Dreamer's derived observations (source_role=dyad,
+#          extraction_version=dyad-v1.2) instead of the caller's text, and
+#          reported segments_stored=0. Finnish input was paraphrased into
+#          English; `category` never reached the server as a field.
+#   NEW  — _tool_store now POSTs {text, category, source, [namespace],
+#          metadata:{source, category}} to /v1/memory/add — the same
+#          direct path _pref_declare has used since v2.7. Verified on
+#          bot-jarmo 2026-08-25: verbatim text, discovery_origin="direct",
+#          source_role=null, namespace honoured, no surprise gate.
+#   NEW  — Normalised tool response: {success, id, text, category,
+#          namespace, total_memories} instead of the raw ingest counters.
+#   KEEP — sync_turn, session and batch ingest stay on /v1/memory/ingest;
+#          conversation history is the correct input for the extractor.
+#   TEST — tests/test_provider_contract.py store tests (lines ~754-777)
+#          must assert on /v1/memory/add (next file).
+#   FIX  — version 2.9.0 -> 2.9.1 (manifest plugin.yaml bumped in step).
 #
 # v2.9.0 CHANGES (RT-13 Layer A — Amendment A5 §2, F2):
 #   NEW  — fidelity.py (F1) soft-imported; two pure classifiers, no LLM.
@@ -352,7 +369,7 @@ logger = logging.getLogger("astral-memory")
 # Constants
 # ---------------------------------------------------------------------------
 
-_VERSION = "2.9.0"
+_VERSION = "2.9.1"
 _DEFAULT_SERVER_URL = "http://127.0.0.1:8090"
 
 # v2.8.0 (P-2): how to read a provenance tag. Attached once per recall
@@ -1074,30 +1091,52 @@ class AstralCoreMemoryProvider(MemoryProvider):
         return json.dumps(data, indent=2, default=str)
 
     def _tool_store(self, args: dict, session_id: str) -> str:
-        text = args.get("text", "")
+        """Store the caller's text verbatim via the direct /v1/memory/add path.
+
+        v2.9.1 (STORE-1): explicit stores must NOT go through
+        /v1/memory/ingest — that endpoint feeds the dyad extractor, which
+        rewrites the input into derived observations and drops the
+        original wording. /v1/memory/add persists the text as given, with
+        no surprise gate, and returns the new memory id.
+        """
+        text = (args.get("text") or "").strip()
         if not text:
             return json.dumps({"error": "text is required"})
-        category = args.get("category", "fact")
+        category = (args.get("category") or "fact").strip() or "fact"
+        source = f"hermes_explicit_{session_id}" if session_id \
+                 else "hermes_explicit"
+
         payload: Dict[str, Any] = {
-            "user_message": text,
-            "assistant_response": f"Stored as {category}.",
-            "source": f"hermes_explicit_{session_id}" if session_id
-                      else "hermes_explicit",
+            "text": text,
+            "category": category,
+            "source": source,
+            "metadata": {
+                "source": "hermes_explicit",
+                "category": category,
+            },
         }
 
         # §10.2: per-call namespace override, else resolve from session.
-        ns_arg = args.get("namespace", "")
-        if ns_arg:
-            payload["namespace"] = ns_arg
-        else:
-            ns = self._resolve_namespace()
-            if ns:
-                payload["namespace"] = ns
+        # Key is omitted entirely when no namespace is active so the server
+        # applies its own default (contract: test_store_omits_namespace_*).
+        ns = args.get("namespace", "") or self._resolve_namespace()
+        if ns:
+            payload["namespace"] = ns
 
-        return json.dumps(
-            self._http.post("/v1/memory/ingest", payload),
-            indent=2, default=str,
-        )
+        result = self._http.post("/v1/memory/add", payload)
+        if not isinstance(result, dict):
+            return json.dumps({"error": f"unexpected server reply: {result!r}"})
+        if "error" in result:
+            return json.dumps({"error": result["error"]})
+
+        return json.dumps({
+            "success": bool(result.get("stored", True)),
+            "id": result.get("memory_id", result.get("id", "")),
+            "text": text,
+            "category": category,
+            "namespace": ns or None,
+            "total_memories": result.get("total_memories"),
+        }, indent=2, default=str)
 
     def _tool_forget(self, args: dict, session_id: str) -> str:
         source = args.get("source", "")
