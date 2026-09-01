@@ -5,6 +5,17 @@
 #          fields); v2.9.0 added RT-13 Layer A response-fidelity feedback
 #          (SPEC-REMEMBERING-TOUCH-001 Amendment A5 §2).
 #
+# v2.9.2 CHANGES (DL-1 — distillation loop guard, SPEC distillation v1.1 §4.6):
+#   NEW  — _is_distilled_write(): two-layer guard (in-process flag via soft
+#          import of astral_distillation; content marker literal
+#          "[astral-distillation v" as cross-process fallback).
+#   FIX  — on_memory_write skips /v1/memory/ingest for distilled writes.
+#          Without this, distilled MEMORY.md/USER.md content is re-ingested
+#          through the dyad extractor and retrieved by the next pass
+#          (amplification loop). Invariant DL-1: /v1/memory/stats total is
+#          unchanged across a distillation pass.
+#   FIX  — version 2.9.1 -> 2.9.2 (manifest plugin.yaml bumped in step).
+#
 # v2.9.1 CHANGES (STORE-1 — explicit store bypasses the extractor):
 #   FIX  — _tool_store POSTed a synthetic dialogue ({user_message: text,
 #          assistant_response: "Stored as <category>."}) to
@@ -369,7 +380,32 @@ logger = logging.getLogger("astral-memory")
 # Constants
 # ---------------------------------------------------------------------------
 
-_VERSION = "2.9.1"
+_VERSION = "2.9.2"
+
+# --- DL-1 loop guard (SPEC astral-core-distillation-spec v1.1 §4.6) --------
+# The distillation pass derives MEMORY.md/USER.md FROM Astral Core; if
+# on_memory_write mirrors those writes back via /v1/memory/ingest, the dyad
+# extractor rewrites the distilled text into derived observations and the
+# next pass retrieves its own output (amplification loop). Two layers:
+#   1) in-process flag from the distillation module (soft import)
+#   2) content marker literal (cross-process safe, module-absence safe)
+
+try:  # layer 1 — present only when astral_distillation ships alongside
+    from astral_distillation import distillation_in_progress as \
+        _distill_in_progress
+except ImportError:  # module not deployed: layer 1 inert, layer 2 active
+    def _distill_in_progress() -> bool:
+        return False
+
+_DISTILL_MARKER_PREFIX = "[astral-distillation v"  # layer 2 literal
+
+
+def _is_distilled_write(content: str) -> bool:
+    """True when the write originates from the distillation pass (DL-1)."""
+    if _distill_in_progress():
+        return True
+    return _DISTILL_MARKER_PREFIX in (content or "")
+# ---------------------------------------------------------------------------
 _DEFAULT_SERVER_URL = "http://127.0.0.1:8090"
 
 # v2.8.0 (P-2): how to read a provenance tag. Attached once per recall
@@ -1863,6 +1899,15 @@ class AstralCoreMemoryProvider(MemoryProvider):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Mirror built-in MEMORY.md / USER.md writes into Astral Core."""
+        # v2.9.2 (DL-1): distillation output is DERIVED from Astral Core —
+        # never mirror it back, or the dyad extractor re-ingests rewritten
+        # copies of it and the next distillation pass retrieves its own
+        # output. Checked before _ready() so no state is touched.
+        if _is_distilled_write(content):
+            logger.debug(
+                "on_memory_write: skipping ingest of distilled %s write "
+                "(DL-1 loop guard)", target)
+            return
         if not self._ready() or not content.strip():
             return
         if action not in ("add", "replace"):
