@@ -14,6 +14,17 @@
 #          through the dyad extractor and retrieved by the next pass
 #          (amplification loop). Invariant DL-1: /v1/memory/stats total is
 #          unchanged across a distillation pass.
+#   NEW  — DIST-1: astral_distillation.py ships in the plugin dir
+#          (soft-imported `from . import astral_distillation`, same
+#          pattern as fidelity). MEMORY.md/USER.md become computed views
+#          of Astral Core (SPEC distillation v1.2).
+#   NEW  — config keys distillation_mode (manual|on_session_start|
+#          on_turn_start, default manual — Phase 1 safe) and
+#          distillation_cache_ttl (default 300s).
+#   NEW  — initialize(): builds DistillationEngine when mode is automatic
+#          and fires a session-start pass via the pool; on_turn_start():
+#          re-fires in on_turn_start mode, deduped by engine TTL. All
+#          passes non-fatal; files keep last state on any failure (AC-3).
 #   FIX  — version 2.9.1 -> 2.9.2 (manifest plugin.yaml bumped in step).
 #
 # v2.9.1 CHANGES (STORE-1 — explicit store bypasses the extractor):
@@ -391,11 +402,13 @@ _VERSION = "2.9.2"
 #   2) content marker literal (cross-process safe, module-absence safe)
 
 try:  # layer 1 — present only when astral_distillation ships alongside
-    from astral_distillation import distillation_in_progress as \
-        _distill_in_progress
+    from . import astral_distillation as _distill  # same pattern as fidelity
 except ImportError:  # module not deployed: layer 1 inert, layer 2 active
-    def _distill_in_progress() -> bool:
-        return False
+    _distill = None
+
+
+def _distill_in_progress() -> bool:
+    return bool(_distill) and _distill.distillation_in_progress()
 
 _DISTILL_MARKER_PREFIX = "[astral-distillation v"  # layer 2 literal
 
@@ -740,6 +753,10 @@ class AstralCoreMemoryProvider(MemoryProvider):
         self._fidelity_enabled: bool = True  # v2.9.0 (RT-13 F2)
         self._data_dir: str = _DEFAULT_DATA_DIR
         self._api_token: str = ""  # v2.5.0: Bearer auth
+        # v2.9.2 (DIST-1): distillation trigger state (SPEC distillation v1.2 §5)
+        self._distill_mode: str = "manual"  # manual|on_session_start|on_turn_start
+        self._distill_cache_ttl: int = 300
+        self._distill_engine = None
 
     # ------------------------------------------------------------------
     # Identity & availability
@@ -824,6 +841,54 @@ class AstralCoreMemoryProvider(MemoryProvider):
                 self._server_url,
             )
 
+        # v2.9.2 (DIST-1): distillation engine — built only when the module
+        # ships alongside and mode is automatic. Manual mode is served by
+        # running the module directly (python3 astral_distillation.py).
+        self._distill_engine = None
+        if _distill is not None and self._distill_mode != "manual":
+            try:
+                self._distill_engine = _distill.DistillationEngine(
+                    _distill.AstralClient(
+                        base_url=self._server_url,
+                        api_token=self._api_token,
+                        hermes_home=Path(self._hermes_home),
+                    ),
+                    _distill.HermesAdapter(hermes_home=Path(self._hermes_home)),
+                    cache_ttl=self._distill_cache_ttl,
+                    log_path=Path(self._hermes_home) / "logs" / "distillation.log",
+                )
+                logger.info(
+                    "astral-memory: distillation active (mode=%s, ttl=%ds) %s",
+                    self._distill_mode, self._distill_cache_ttl,
+                    _distill.DISTILL_MARKER)
+                if self._server_healthy:
+                    # Session start counts as a trigger in both automatic
+                    # modes; engine TTL dedups on_turn_start re-fires.
+                    self._submit(self._run_distillation)
+            except Exception as e:  # engine failure must never break init
+                logger.warning("astral-memory: distillation disabled: %s", e)
+                self._distill_engine = None
+
+    def _run_distillation(self) -> None:
+        """Background distillation pass (DIST-1). Non-fatal by contract:
+        MEMORY.md/USER.md keep their last state on any failure (AC-3)."""
+        eng = self._distill_engine
+        if eng is None:
+            return
+        try:
+            res = eng.run()
+            if res.wrote:
+                logger.info(
+                    "astral-memory: distilled %d/%d memories -> %s",
+                    res.selected, res.fetched,
+                    ", ".join(Path(p).name for p in res.files))
+            elif res.warning and res.warning != "cache_fresh_skip":
+                logger.debug("astral-memory: distillation skipped: %s",
+                             res.warning)
+        except Exception as e:
+            logger.debug("astral-memory: distillation pass failed "
+                         "(non-fatal): %s", e)
+
     def _load_config(self) -> None:
         cfg = _read_config(self._hermes_home)
         self._server_url = cfg.get("server_url", self._server_url)
@@ -863,6 +928,23 @@ class AstralCoreMemoryProvider(MemoryProvider):
         if _fidelity is None and self._fidelity_enabled:
             logger.info("astral-memory: fidelity module absent; RT-13 signals disabled")
             self._fidelity_enabled = False
+
+        # v2.9.2 (DIST-1): distillation trigger config. Default `manual`
+        # keeps Phase 1 semantics — no automatic writes to MEMORY.md/USER.md
+        # until the operator opts in (SPEC distillation v1.2 §10).
+        mode = str(cfg.get("distillation_mode", self._distill_mode) or "manual")
+        if mode not in ("manual", "on_session_start", "on_turn_start"):
+            logger.warning(
+                "Invalid distillation_mode '%s' — falling back to manual", mode)
+            mode = "manual"
+        if _distill is None and mode != "manual":
+            logger.info(
+                "astral-memory: astral_distillation module absent; "
+                "distillation_mode forced to manual")
+            mode = "manual"
+        self._distill_mode = mode
+        self._distill_cache_ttl = int(
+            cfg.get("distillation_cache_ttl", self._distill_cache_ttl))
 
         scope = str(cfg.get("session_scope", "") or "").strip().lower()
         self._session_scope = scope if scope == "verification" else None
@@ -1656,6 +1738,12 @@ class AstralCoreMemoryProvider(MemoryProvider):
                 and self._ready()):
             self._submit(self._http.post, "/v1/memory/consolidate")
 
+        # v2.9.2 (DIST-1): freshest-context mode. The engine's cache TTL
+        # makes this a no-op on most turns; DL-1 guard keeps the resulting
+        # writes out of on_memory_write's ingest mirror.
+        if self._distill_mode == "on_turn_start" and self._distill_engine:
+            self._submit(self._run_distillation)
+
     def on_session_switch(
         self,
         new_session_id: str,
@@ -2003,6 +2091,25 @@ class AstralCoreMemoryProvider(MemoryProvider):
                 ),
                 "default": "true",
                 "choices": ["true", "false"],
+            },
+            {
+                "key": "distillation_mode",
+                "description": (
+                    "Derive MEMORY.md/USER.md from Astral Core (SPEC "
+                    "distillation v1.2). 'manual': only via the standalone "
+                    "module. 'on_session_start': once per session. "
+                    "'on_turn_start': every turn, deduped by TTL."
+                ),
+                "default": "manual",
+                "choices": ["manual", "on_session_start", "on_turn_start"],
+            },
+            {
+                "key": "distillation_cache_ttl",
+                "description": (
+                    "Seconds between distillation passes; re-triggers "
+                    "within the window are skipped."
+                ),
+                "default": "300",
             },
             {
                 "key": "briefing_on_start",
