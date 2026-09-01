@@ -22,7 +22,7 @@
     FIX  — Lifecycle section documents session_id-scoped calls and the hooks
            added in v2.2.0 (on_session_switch, on_delegation, backup_paths).
     FIX  — "daemon threads" -> bounded worker pool.
-    FIX  — Repository structure reflects tests/ and .github/; tools.py removed.
+    FIX  — Repository structure reflects tests/; tools.py removed.
 
   UNRESOLVED — see the note at the bottom of this file before publishing.
     `rerank_server.py` is referenced in Quick Start, Repository Structure,
@@ -405,7 +405,6 @@ memory-hermes/
 │   └── astral-memory.md        ← Agent skill file
 ├── tests/
 │   └── test_provider_contract.py   ← Guards against interface drift
-├── .github/workflows/ci.yml    ← Pinned contract job + nightly upstream canary
 ├── pyproject.toml
 ├── README.md
 └── LICENSE
