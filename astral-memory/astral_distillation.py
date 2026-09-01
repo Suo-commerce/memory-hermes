@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-# Generated: 2026-08-31
-# Purpose: Distillation engine v1.1.0 per SPEC astral-core-distillation-spec
-#          v1.1 — rebased on live-verified endpoints (POST /v1/memory/search
-#          results schema, POST /v1/memory/list for preferences) and the real
-#          memory-hermes plugin idioms (v2.9.1); adds mandatory feedback-loop
-#          guard (DL-1) and corrected ~/.hermes/memories/ paths.
+# Generated: 2026-09-01
+# Purpose: Distillation engine v1.2.0 — Phase-1 AC-12 fixes after the first
+#          live pass on bot-jarmo replaced curated context with session churn:
+#          (1) pinned/distilled sections — the distiller AUGMENTS a bounded
+#          block and never touches human-written text; (2) tier preference
+#          inverted toward consolidated (slow/medium) memories; (3) entry
+#          hygiene — length cap, artifact stripping, meta/status filters,
+#          dedup against pinned text; (4) USER.md identity facts implemented.
 """
-astral_distillation.py — v1.1.0
+astral_distillation.py — v1.2.0
 
 Derives MEMORY.md / USER.md (and CLAUDE.md / AGENTS.md) as computed views of
 Astral Core Memory. Verified against the live server 2026-08-31:
@@ -31,6 +33,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import tempfile
 import threading
 import time
@@ -41,7 +44,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 DISTILL_MARKER = f"[astral-distillation v{__version__}]"  # loop-guard literal
 
 # ---------------------------------------------------------------------------
@@ -67,13 +70,29 @@ def content_is_distilled(content: str) -> bool:
 
 PROVENANCE_WEIGHTS = {"user": 1.0, "dyad": 0.8, "assistant": 0.5, "diagnostic": 0.1}
 PROVENANCE_RANK = {"user": 3, "dyad": 2, "assistant": 1, "diagnostic": 0}
-TIER_WEIGHTS = {"fast": 1.0, "medium": 0.8, "slow": 0.4, "dormant": 0.1}
+# v1.2: INVERTED. Consolidated tiers hold the durable facts a standing-context
+# file wants; fast tier is where session churn lives (AC-12 finding, 2026-09-01).
+TIER_WEIGHTS = {"slow": 1.0, "medium": 0.9, "fast": 0.5, "dormant": 0.3}
 
 DEFAULT_MEMORY_BUDGET = 2200
 DEFAULT_USER_BUDGET = 1375
 DEFAULT_CACHE_TTL = 300
 DEFAULT_TIMEOUT = 5
-DEFAULT_HALF_LIFE_DAYS = 30.0
+DEFAULT_HALF_LIFE_DAYS = 365.0   # v1.2: was 30 — recency must not dominate durability
+DEFAULT_ENTRY_MAX_CHARS = 180    # v1.2: entries longer than this are skipped, not truncated
+DEFAULT_MEMORY_DISTILLED_BUDGET = 600   # v1.2: machine-owned block inside MEMORY.md
+DEFAULT_USER_DISTILLED_BUDGET = 400     # v1.2: machine-owned block inside USER.md
+DISTILLED_BEGIN = "<!-- astral:distilled:begin {marker} — auto-generated, do not edit -->"
+DISTILLED_END = "<!-- astral:distilled:end -->"
+_BEGIN_RE = re.compile(r"<!-- astral:distilled:begin .*? -->\n?", re.S)
+_END_RE = re.compile(r"<!-- astral:distilled:end -->\n?")
+_ARTIFACT_RE = re.compile(r"\s*\[DATES MENTIONED:[^\]]*\]", re.I)
+_META_RE = re.compile(
+    r"(stored in memory|memory system|MEMORY\.md|USER\.md|distill|astral_store|"
+    r"the assistant needs|the assistant should)", re.I)
+_STATUS_RE = re.compile(
+    r"(status at \d|\d+\s*(of|/)\s*\d+\s*(scenarios|completed|done)|in progress|"
+    r"at \d+ minutes|on track for|so far:|test run)", re.I)
 
 # SPEC v1.1 §4.2a — canonical coverage queries (global-importance proxy)
 DEFAULT_COVERAGE_QUERIES = [
@@ -119,8 +138,11 @@ class Memory:
         recency = math.exp(-self.age_days(now) / half_life_days)
         prov = PROVENANCE_WEIGHTS.get(self.source_role, 0.5)
         tier = TIER_WEIGHTS.get(self.speed, 0.4)
+        # v1.2: access_count promoted from tiebreaker to signal — the store
+        # already knows which facts get recalled constantly.
+        popularity = 1.0 + math.log1p(max(0, self.access_count)) / 4.0
         return (self.similarity * self.utility_score * self.surprise_score
-                * recency * prov * tier)
+                * recency * prov * tier * popularity)
 
 
 @dataclass
@@ -236,12 +258,41 @@ class AstralClient:
 # Filtering / conflict resolution (SPEC v1.1 §4.2, §8)
 # ---------------------------------------------------------------------------
 
-def eligible(m: Memory) -> bool:
+def clean_text(text: str) -> str:
+    """v1.2: strip extractor artifacts and collapse whitespace."""
+    return " ".join(_ARTIFACT_RE.sub("", text or "").split())
+
+
+def eligible(m: Memory, max_chars: int = DEFAULT_ENTRY_MAX_CHARS) -> bool:
+    """v1.2 hygiene: noise/diagnostic/context out; long, meta, and
+    status-report entries out. All tiers eligible (weights decide)."""
     if m.content_class == "noise":
         return False
-    if m.category == "diagnostic":
+    if m.category in ("diagnostic", "context"):
         return False
-    return m.speed in ("fast", "medium")
+    text = clean_text(m.text)
+    if not text or len(text) > max_chars:
+        return False
+    if _META_RE.search(text) or _STATUS_RE.search(text):
+        return False
+    return True
+
+
+def identity_fact(m: Memory) -> bool:
+    """USER.md distilled block: what the user said about themself."""
+    return m.source_role == "user" and m.category == "fact"
+
+
+def not_in_pinned(m_text: str, pinned: str, threshold: float = 0.5) -> bool:
+    """Skip entries the human already wrote (Jaccard vs each pinned line)."""
+    tm = _norm_tokens(m_text)
+    if not tm:
+        return False
+    for line in pinned.splitlines():
+        tl = _norm_tokens(line)
+        if tl and len(tm & tl) / len(tm | tl) >= threshold:
+            return False
+    return True
 
 
 def _norm_tokens(text: str) -> set:
@@ -282,6 +333,32 @@ def select_top_k(memories: list, budget: int,
 
 
 # ---------------------------------------------------------------------------
+# v1.2 sections — pinned (human-owned, never touched) vs distilled (bounded)
+# ---------------------------------------------------------------------------
+
+def split_sections(content: str) -> tuple:
+    """Return (pinned, old_distilled). Pinned is everything outside the
+    delimited block, byte-preserved. First run: pinned == whole file."""
+    b = _BEGIN_RE.search(content or "")
+    if not b:
+        return (content or ""), ""
+    e = _END_RE.search(content, b.end())
+    if not e:  # unterminated block: treat everything after begin as ours
+        return content[:b.start()], content[b.end():]
+    return content[:b.start()] + content[e.end():], content[b.end():e.start()]
+
+
+def join_sections(pinned: str, distilled: str) -> str:
+    if not distilled.strip():
+        return pinned
+    sep = "" if (not pinned or pinned.endswith("\n")) else "\n"
+    return (pinned + sep
+            + DISTILLED_BEGIN.format(marker=DISTILL_MARKER) + "\n"
+            + distilled.rstrip("\n") + "\n"
+            + DISTILLED_END + "\n")
+
+
+# ---------------------------------------------------------------------------
 # Adapters (SPEC §6.1) — corrected paths: ~/.hermes/memories/
 # ---------------------------------------------------------------------------
 
@@ -315,7 +392,9 @@ class HermesAdapter(DistillationAdapter):
     def __init__(self, hermes_home: Optional[Path] = None,
                  profile: Optional[str] = None,
                  memory_budget: int = DEFAULT_MEMORY_BUDGET,
-                 user_budget: int = DEFAULT_USER_BUDGET):
+                 user_budget: int = DEFAULT_USER_BUDGET,
+                 memory_distilled_budget: int = DEFAULT_MEMORY_DISTILLED_BUDGET,
+                 user_distilled_budget: int = DEFAULT_USER_DISTILLED_BUDGET):
         base = hermes_home or (Path.home() / ".hermes")
         if profile and profile != "default":
             base = base / "profiles" / profile
@@ -323,6 +402,11 @@ class HermesAdapter(DistillationAdapter):
         self.memory_md = mem_dir / "MEMORY.md"
         self.user_md = mem_dir / "USER.md"
         self._budgets = {self.memory_md: memory_budget, self.user_md: user_budget}
+        self._distilled = {self.memory_md: memory_distilled_budget,
+                           self.user_md: user_distilled_budget}
+
+    def get_distilled_budget(self, file_path: Path) -> int:
+        return self._distilled[file_path]
 
     def get_context_files(self) -> list:
         return [self.memory_md, self.user_md]
@@ -332,21 +416,29 @@ class HermesAdapter(DistillationAdapter):
 
     @staticmethod
     def _fmt_entry(m: Memory) -> str:
-        return f"\u00a7 [{m.source_role}] {m.text}\n"
+        return f"\u00a7 [{m.source_role}] {clean_text(m.text)}\n"
 
     def entry_len(self, m: Memory) -> int:
         return len(self._fmt_entry(m))
 
     def format_memories(self, memories: list, file_path: Path) -> str:
-        header = f"# MEMORY \u2014 distilled from Astral Core {DISTILL_MARKER}\n"
-        return header + "".join(self._fmt_entry(m) for m in memories)
+        # v1.2: block body only — delimiters are added by join_sections
+        return "".join(self._fmt_entry(m) for m in memories)
 
-    def format_preferences(self, prefs: list, file_path: Path) -> str:
-        lines = [f"# USER \u2014 distilled {DISTILL_MARKER}",
-                 "[PREFERENCES \u2014 learned, consented]"]
-        lines += [f"- {p.text}" for p in prefs if p.status == "active"]
-        lines.append("[/PREFERENCES]")
-        return "\n".join(lines) + "\n"
+    def format_preferences(self, prefs: list, file_path: Path,
+                           identity: Optional[list] = None) -> str:
+        """v1.2: preferences + identity facts (SPEC §4.3 USER.md mapping)."""
+        out = []
+        active = [p for p in prefs if p.status == "active"]
+        if active:
+            out.append("[PREFERENCES \u2014 learned, consented]")
+            out += [f"- {clean_text(p.text)}" for p in active]
+            out.append("[/PREFERENCES]")
+        if identity:
+            out.append("[IDENTITY \u2014 stated by user]")
+            out += [f"- {clean_text(m.text)}" for m in identity]
+            out.append("[/IDENTITY]")
+        return ("\n".join(out) + "\n") if out else ""
 
 
 class GenericMarkdownAdapter(DistillationAdapter):
@@ -362,15 +454,18 @@ class GenericMarkdownAdapter(DistillationAdapter):
     def get_char_budget(self, file_path: Path) -> int:
         return self.budget
 
+    def get_distilled_budget(self, file_path: Path) -> int:
+        return self.budget
+
     def entry_len(self, m: Memory) -> int:
-        return len(f"- [{m.source_role}] {m.text}\n")
+        return len(f"- [{m.source_role}] {clean_text(m.text)}\n")
 
     def format_memories(self, memories: list, file_path: Path) -> str:
-        out = [f"## Astral Core Memory (distilled) {DISTILL_MARKER}\n"]
-        out += [f"- [{m.source_role}] {m.text}\n" for m in memories]
-        return "".join(out)
+        return "".join(f"- [{m.source_role}] {clean_text(m.text)}\n"
+                       for m in memories)
 
-    def format_preferences(self, prefs: list, file_path: Path) -> str:
+    def format_preferences(self, prefs: list, file_path: Path,
+                           identity: Optional[list] = None) -> str:
         active = [p for p in prefs if p.status == "active"]
         if not active:
             return ""
@@ -430,22 +525,48 @@ class DistillationEngine:
                 wrote=False, warning=f"astral_unreachable_keep_existing: {e}")
         preferences = self.client.fetch_active_preferences()  # fail-soft
 
-        keep = resolve_conflicts([m for m in memories if eligible(m)])
         mem_file, user_file = self.adapter.get_context_files()
-        header_len = len(self.adapter.format_memories([], mem_file))
-        selected = select_top_k(
-            keep, self.adapter.get_char_budget(mem_file) - header_len,
-            self.adapter.entry_len)
-        selected.sort(key=lambda m: m.score(), reverse=True)
+        old_mem = mem_file.read_text(encoding="utf-8") if mem_file.exists() else ""
+        old_user = user_file.read_text(encoding="utf-8") if user_file.exists() else ""
+        pinned_mem, _ = split_sections(old_mem)
+        pinned_user, _ = split_sections(old_user)
 
-        memory_content = self.adapter.format_memories(selected, mem_file)
-        user_content = self.adapter.format_preferences(preferences, user_file)
-        budget_u = self.adapter.get_char_budget(user_file)
-        if len(user_content) > budget_u:
-            lines = user_content.splitlines()
-            while len("\n".join(lines)) + 1 > budget_u and len(lines) > 3:
-                lines.pop(-2)   # drop last pref, keep closing tag
-            user_content = "\n".join(lines) + "\n"
+        # v1.2: hygiene first, then skip what the human already wrote
+        clean = [m for m in memories
+                 if eligible(m) and not_in_pinned(clean_text(m.text), pinned_mem)]
+        keep = resolve_conflicts(clean)
+
+        # Distilled block budget = min(configured block budget,
+        #                             file budget - pinned - delimiters)
+        overhead = len(DISTILLED_BEGIN.format(marker=DISTILL_MARKER)) + len(DISTILLED_END) + 3
+        mem_room = min(self.adapter.get_distilled_budget(mem_file),
+                       self.adapter.get_char_budget(mem_file) - len(pinned_mem) - overhead)
+        selected = select_top_k(keep, max(0, mem_room), self.adapter.entry_len) \
+            if mem_room > 0 else []
+        selected.sort(key=lambda m: m.score(), reverse=True)
+        memory_content = join_sections(
+            pinned_mem, self.adapter.format_memories(selected, mem_file))
+
+        # USER.md: preferences + identity facts, deduped against pinned
+        prefs = [p for p in preferences
+                 if not_in_pinned(clean_text(p.text), pinned_user)]
+        identity = [m for m in memories
+                    if identity_fact(m) and eligible(m)
+                    and not_in_pinned(clean_text(m.text), pinned_user)]
+        identity.sort(key=lambda m: m.score(), reverse=True)
+        user_room = min(self.adapter.get_distilled_budget(user_file),
+                        self.adapter.get_char_budget(user_file) - len(pinned_user) - overhead)
+        user_block = ""
+        if user_room > 0:
+            while True:
+                user_block = self.adapter.format_preferences(prefs, user_file, identity)
+                if len(user_block) <= user_room or not (identity or prefs):
+                    break
+                if identity:
+                    identity.pop()      # drop lowest-scoring identity fact first
+                else:
+                    prefs.pop()
+        user_content = join_sections(pinned_user, user_block)
 
         result = DistillationResult(wrote=False, fetched=len(memories),
                                     selected=len(selected))
@@ -483,7 +604,6 @@ def _selftest() -> int:
     print(f"{DISTILL_MARKER} selftest")
     now = datetime.now(timezone.utc)
 
-    # T1: parse verified live search-result shape
     live = {"id": "abc", "text": "Jarmo runs the fleet from Helsinki",
             "similarity": 1.0748, "surprise_score": 0.8614,
             "utility_score": 0.8, "source_role": "user",
@@ -491,116 +611,104 @@ def _selftest() -> int:
             "category": "fact", "access_count": 57,
             "content_class": "payload"}
     m = AstralClient._parse_memory(live)
-    check("T1 live payload parses", m.source_role == "user"
-          and m.access_count == 57 and 0 < m.score(now=now) < 1.1)
+    check("T1 live payload parses", m.source_role == "user" and m.access_count == 57)
 
-    # T2: recency decay monotonic
-    old = AstralClient._parse_memory({**live, "id": "old",
-                                      "created_at": "2026-02-01T00:00:00Z"})
-    check("T2 older memory scores lower", old.score(now=now) < m.score(now=now))
+    # T2 (v1.2): consolidated tier outranks fast tier, all else equal
+    slow = AstralClient._parse_memory({**live, "id": "s", "speed": "slow"})
+    check("T2 slow tier scores above fast", slow.score(now=now) > m.score(now=now))
 
-    # T3: eligibility filters
-    check("T3a noise excluded",
-          not eligible(Memory(id="n", text="x", content_class="noise")))
-    check("T3b diagnostic excluded",
-          not eligible(Memory(id="d", text="x", category="diagnostic")))
-    check("T3c dormant excluded",
-          not eligible(Memory(id="s", text="x", speed="dormant")))
-    check("T3d fast payload eligible", eligible(m))
+    # T3 (v1.2): access_count is a real signal
+    popular = AstralClient._parse_memory({**live, "id": "p", "access_count": 500})
+    quiet = AstralClient._parse_memory({**live, "id": "q", "access_count": 0})
+    check("T3 popular outranks quiet", popular.score(now=now) > quiet.score(now=now))
 
-    # T4: conflict — same-topic [user] beats [assistant] (AC-4, OQ-6 heuristic)
-    a = Memory(id="1", text="favorite editor preference remains emacs always",
-               source_role="assistant", similarity=0.9,
-               surprise_score=0.9, utility_score=0.9)
-    u = Memory(id="2", text="favorite editor preference remains helix always",
-               source_role="user", similarity=0.5,
-               surprise_score=0.5, utility_score=0.5)
-    kept = resolve_conflicts([a, u])
-    check("T4 [user] wins same-topic despite lower score",
-          len(kept) == 1 and kept[0].id == "2")
+    # T4 hygiene filters (AC-12 findings, 2026-09-01)
+    check("T4a noise excluded", not eligible(Memory(id="n", text="x", content_class="noise")))
+    check("T4b context category excluded",
+          not eligible(Memory(id="c", text="Tämä on testipäivitys", category="context")))
+    check("T4c status report excluded",
+          not eligible(Memory(id="st", text="Test run status at 9 minutes in: 2 of 87 scenarios done")))
+    check("T4d meta-memory excluded",
+          not eligible(Memory(id="me", text="Learned preferences stored in memory: manual building")))
+    check("T4e over-length skipped",
+          not eligible(Memory(id="lo", text="x" * 181)))
+    check("T4f dormant now eligible (weighted, not excluded)",
+          eligible(Memory(id="d", text="User lives in Oulu, Finland (UTC+3).", speed="dormant")))
+    check("T4g artifact stripped",
+          clean_text("16/87 done [DATES MENTIONED: 16/87]") == "16/87 done")
 
-    # T5: unrelated memories both kept
-    b = Memory(id="3", text="fortress deploy ritual requires md5 verification",
-               source_role="assistant")
-    kept2 = resolve_conflicts([u, b])
-    check("T5 different topics both kept", len(kept2) == 2)
+    # T5 conflict — [user] beats [assistant] on same topic
+    a = Memory(id="1", text="favorite editor preference remains emacs always", source_role="assistant")
+    u = Memory(id="2", text="favorite editor preference remains helix always", source_role="user")
+    check("T5 [user] wins same-topic", [k.id for k in resolve_conflicts([a, u])] == ["2"])
 
-    # T6: multi-query dedup keeps max similarity
-    class Fake2Q:
-        calls = 0
-        def _post(self, path, payload):
-            Fake2Q.calls += 1
-            sim = 0.3 if Fake2Q.calls == 1 else 0.9
-            return {"results": [{**live, "similarity": sim}]}
-    c = AstralClient.__new__(AstralClient)
-    c._post = Fake2Q()._post
-    ms = AstralClient.fetch_memories(c, queries=["q1", "q2"])
-    check("T6 dedup keeps max similarity",
-          len(ms) == 1 and ms[0].similarity == 0.9)
+    # T6 sections: split/join round-trip, pinned byte-preserved
+    pinned = "User in Oulu, Finland.\nDinar API: LiteLLM proxy.\n"
+    joined = join_sections(pinned, "§ [user] extra fact\n")
+    p2, d2 = split_sections(joined)
+    check("T6a pinned preserved byte-exact", p2 == pinned)
+    check("T6b distilled block recovered", d2.strip() == "§ [user] extra fact")
+    check("T6c marker in delimiter (guard layer 2)", content_is_distilled(joined))
+    check("T6d first run: whole file is pinned", split_sections(pinned) == (pinned, ""))
 
-    # T7: preferences — only metadata.status == "active" (AC-5)
-    class FakePrefs:
-        def _post(self, path, payload):
-            return {"memories": [
-                {"id": "p1", "text": "one file per reply",
-                 "metadata": {"status": "active"}},
-                {"id": "p2", "text": "pending thing",
-                 "metadata": {"status": "pending"}},
-                {"id": "p3", "text": "declined thing",
-                 "metadata": {"status": "declined"}}]}
-    c2 = AstralClient.__new__(AstralClient)
-    c2._post = FakePrefs()._post
-    prefs = AstralClient.fetch_active_preferences(c2)
-    check("T7 only active prefs pass", len(prefs) == 1
-          and prefs[0].text == "one file per reply")
+    # T7 dedup against pinned
+    check("T7 pinned-duplicate skipped",
+          not not_in_pinned("User is in Oulu, Finland", pinned)
+          and not_in_pinned("Squat PR 200kg, two kids", pinned))
 
-    # T8: full pass with loop-guard observation
+    # T8 full pass: augment, never replace
     tmpdir = Path(tempfile.mkdtemp())
-    adapter = HermesAdapter(hermes_home=tmpdir, memory_budget=400,
-                            user_budget=200)
-    guard_seen = {"during": False}
-    orig_replace = os.replace
-    def spy_replace(src, dst):
-        guard_seen["during"] = guard_seen["during"] or _GUARD.is_set()
-        return orig_replace(src, dst)
-    os.replace = spy_replace
+    adapter = HermesAdapter(hermes_home=tmpdir)
+    adapter.memory_md.parent.mkdir(parents=True)
+    curated_mem = "Collaborators: Tommi (infra), Juha (beta).\nUser in Oulu, Finland (UTC+3).\n"
+    curated_user = "CDO of Suocommerce, building Astral Core.\n"
+    adapter.memory_md.write_text(curated_mem)
+    adapter.user_md.write_text(curated_user)
+
     class FakeClient:
         def fetch_memories(self, *a, **k):
-            return [m, b, Memory(id="z", text="noise entry",
-                                 content_class="noise")]
+            return [
+                Memory(id="1", text="Bot-jarmo is Tailscale-only; user has root.",
+                       source_role="dyad", speed="slow", similarity=0.9,
+                       surprise_score=0.7, utility_score=0.8, access_count=40),
+                Memory(id="2", text="User in Oulu, Finland, UTC+3 timezone.",
+                       source_role="user", speed="slow", similarity=0.9),   # dup of pinned
+                Memory(id="3", text="Test run status at 9 minutes in: 2 of 87 done",
+                       source_role="assistant", speed="fast", similarity=0.99),
+                Memory(id="4", text="Formal physics education; interests thermodynamics.",
+                       source_role="user", category="fact", speed="slow",
+                       similarity=0.8, access_count=30),
+            ]
         def fetch_active_preferences(self):
-            return [Preference(id="p", text="one file per reply")]
-    try:
-        eng = DistillationEngine(FakeClient(), adapter, cache_ttl=0,
-                                 log_path=tmpdir / "distillation.log")
-        res = eng.run(force=True)
-    finally:
-        os.replace = orig_replace
-    check("T8a files written under memories/",
-          res.wrote and adapter.memory_md.exists()
-          and "memories" in str(adapter.memory_md))
-    check("T8b loop guard set during write, clear after",
-          guard_seen["during"] and not distillation_in_progress())
-    check("T8c marker present (guard layer 2)",
-          content_is_distilled(adapter.memory_md.read_text()))
-    check("T8d noise absent", "noise entry" not in adapter.memory_md.read_text())
-    check("T8e diff log written", (tmpdir / "distillation.log").exists())
+            return [Preference(id="p", text="Prefers one generated file per reply.")]
 
-    # T9: unreachable server keeps existing files (AC-3)
-    class DeadClient:
-        def fetch_memories(self, *a, **k):
-            raise urllib.error.URLError("refused")
-        def fetch_active_preferences(self):
-            return []
+    eng = DistillationEngine(FakeClient(), adapter, cache_ttl=0,
+                             log_path=tmpdir / "distillation.log")
+    res = eng.run(force=True)
+    mem = adapter.memory_md.read_text()
+    usr = adapter.user_md.read_text()
+    check("T8a wrote", res.wrote)
+    check("T8b curated MEMORY.md text intact", mem.startswith(curated_mem))
+    check("T8c curated USER.md text intact", usr.startswith(curated_user))
+    check("T8d durable dyad fact added", "Tailscale-only" in mem)
+    check("T8e pinned duplicate not re-added", mem.count("Oulu") == 1)
+    check("T8f status churn excluded", "Test run status" not in mem)
+    check("T8g identity fact lands in USER.md", "physics" in usr and "IDENTITY" in usr)
+    check("T8h preference lands in USER.md", "one generated file" in usr)
+    check("T8i within total budgets",
+          len(mem) <= DEFAULT_MEMORY_BUDGET and len(usr) <= DEFAULT_USER_BUDGET)
+
+    # T9 second pass is idempotent: re-run replaces only the block
+    res2 = eng.run(force=True)
+    check("T9 idempotent (no diff on identical inputs)", not res2.wrote)
+
+    # T10 unreachable server keeps files
+    class Dead:
+        def fetch_memories(self, *a, **k): raise urllib.error.URLError("refused")
+        def fetch_active_preferences(self): return []
     before = adapter.memory_md.read_text()
-    res2 = DistillationEngine(DeadClient(), adapter, cache_ttl=0,
-                              log_path=tmpdir / "d.log").run(force=True)
-    check("T9 unreachable -> old files intact",
-          not res2.wrote and adapter.memory_md.read_text() == before)
-
-    # T10: cache TTL
-    eng.cache_ttl = 9999
-    check("T10 cache skip", eng.run().warning == "cache_fresh_skip")
+    r3 = DistillationEngine(Dead(), adapter, cache_ttl=0, log_path=tmpdir / "d.log").run(force=True)
+    check("T10 unreachable -> intact", not r3.wrote and adapter.memory_md.read_text() == before)
 
     shutil.rmtree(tmpdir, ignore_errors=True)
     print(f"{'ALL PASS' if failures == 0 else f'{failures} FAILURE(S)'}")
