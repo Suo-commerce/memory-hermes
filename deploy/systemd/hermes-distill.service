@@ -1,0 +1,23 @@
+# Generated: 2026-09-02
+# Purpose: One-shot render of the approved Astral digest into
+#          MEMORY.md/USER.md (SPEC-DIGEST-AUTOMATION-001 §3, Component B).
+#
+# PRE-FLIGHT before install (B-AC3 — the WorkingDirectory is the loader
+# path verified live 2026-09-01; the .hermes/plugins/astral-memory.staging-*
+# directory is a DEAD staging copy, do not point here at it):
+#   sudo test -f /home/hermes/.hermes/hermes-agent/plugins/memory/astral_memory/astral_distillation.py && echo OK
+#
+# Install ritual:
+#   sudo cp hermes-distill.service hermes-distill.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now hermes-distill.timer
+#   systemctl list-timers 'hermes-distill*'
+[Unit]
+Description=Astral digest renderer (MEMORY.md/USER.md distilled blocks)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=hermes
+WorkingDirectory=/home/hermes/.hermes/hermes-agent/plugins/memory/astral_memory
+ExecStart=/usr/bin/python3 astral_distillation.py

@@ -5,6 +5,36 @@
 #          fields); v2.9.0 added RT-13 Layer A response-fidelity feedback
 #          (SPEC-REMEMBERING-TOUCH-001 Amendment A5 §2).
 #
+# v2.10.0 CHANGES (SPEC-DIGEST-AUTOMATION-001 v0.2, Components C + D):
+#   NEW  — C: astral_preferences gains namespace="distilled" — the digest
+#          consent surface, reachable from Signal chat. Actions: pending,
+#          approve, decline, show. ALL approval traffic routes ONLY through
+#          POST /v1/memory/digest/approve (LA-1 / C-AC3: never the generic
+#          status PATCH — that path stays preferences-only, where the
+#          server's consent-gated PATCH validation applies). 8-char id
+#          prefixes are resolved against the live pending list; ambiguous
+#          or unknown prefixes error without any server write.
+#   NEW  — C.2: session-start digest note. on_turn_start checks
+#          GET /v1/memory/digest pending_count, gated by a PERSISTED TTL
+#          timestamp (~/.hermes/.digest_notify_ts, default 6h; config keys
+#          digest_notify / digest_notify_ttl). When pending > 0,
+#          system_prompt_block carries one line: "[astral] N digest
+#          claim(s) pending approval — ask me to list them." Note renders
+#          once per TTL window (count cleared after render). The TTL is
+#          the mechanism; turn numbers are not consulted (spec F2).
+#   NEW  — D: DL-1 third layer. sync_turn skips any turn containing the
+#          literal "[astral-distillation v" — the assistant quoting its
+#          distilled block must not re-enter the store via auto-capture
+#          (2026-09-01 finding: stale block text polluting recall).
+#          Explicit astral_store is NOT affected (deliberate user action
+#          wins; server-side scrub protects the digest pool regardless).
+#          Counter: _capture_skipped_distilled, surfaced in astral_sync.
+#          MARKER CONTRACT: the literal must match astral_distillation.py
+#          DISTILL_MARKER ("[astral-distillation vX.Y.Z]"); if the
+#          renderer's marker format changes, update _DISTILL_CAPTURE_SKIP
+#          in lockstep (SPEC-DIGEST-AUTOMATION-001 §5).
+#   FIX  — version 2.9.2 -> 2.10.0 (schemas.py + plugin.yaml in step).
+#
 # v2.9.2 CHANGES (DL-1 — distillation loop guard, SPEC distillation v1.1 §4.6):
 #   NEW  — _is_distilled_write(): two-layer guard (in-process flag via soft
 #          import of astral_distillation; content marker literal
@@ -391,7 +421,7 @@ logger = logging.getLogger("astral-memory")
 # Constants
 # ---------------------------------------------------------------------------
 
-_VERSION = "2.9.2"
+_VERSION = "2.10.0"
 
 # --- DL-1 loop guard (SPEC astral-core-distillation-spec v1.1 §4.6) --------
 # The distillation pass derives MEMORY.md/USER.md FROM Astral Core; if
@@ -411,6 +441,8 @@ def _distill_in_progress() -> bool:
     return bool(_distill) and _distill.distillation_in_progress()
 
 _DISTILL_MARKER_PREFIX = "[astral-distillation v"  # layer 2 literal
+# v2.10.0 (D): same literal, used by sync_turn capture skip (layer 3).
+_DISTILL_CAPTURE_SKIP = _DISTILL_MARKER_PREFIX
 
 
 def _is_distilled_write(content: str) -> bool:
@@ -757,6 +789,11 @@ class AstralCoreMemoryProvider(MemoryProvider):
         self._distill_mode: str = "manual"  # manual|on_session_start|on_turn_start
         self._distill_cache_ttl: int = 300
         self._distill_engine = None
+        # v2.10.0 (C.2 + D)
+        self._digest_notify: bool = True
+        self._digest_notify_ttl: int = 21600
+        self._digest_note_pending: int = 0          # rendered-once note count
+        self._capture_skipped_distilled: int = 0    # D-AC3 counter
 
     # ------------------------------------------------------------------
     # Identity & availability
@@ -945,6 +982,10 @@ class AstralCoreMemoryProvider(MemoryProvider):
         self._distill_mode = mode
         self._distill_cache_ttl = int(
             cfg.get("distillation_cache_ttl", self._distill_cache_ttl))
+
+        # v2.10.0 (C.2): digest pending-approval note.
+        self._digest_notify = bool(cfg.get("digest_notify", True))
+        self._digest_notify_ttl = int(cfg.get("digest_notify_ttl", 21600))
 
         scope = str(cfg.get("session_scope", "") or "").strip().lower()
         self._session_scope = scope if scope == "verification" else None
@@ -1296,8 +1337,12 @@ class AstralCoreMemoryProvider(MemoryProvider):
                           indent=2, default=str)
 
     def _tool_sync(self, args: dict, session_id: str) -> str:
-        return json.dumps(self._http.post("/v1/sync/trigger"),
-                          indent=2, default=str)
+        result = self._http.post("/v1/sync/trigger")
+        if isinstance(result, dict):
+            # v2.10.0 (D-AC3): capture-guard counter visible in status.
+            result["capture_skipped_distilled"] = \
+                self._capture_skipped_distilled
+        return json.dumps(result, indent=2, default=str)
 
     def _tool_namespace(self, args: dict, session_id: str) -> str:
         """Set, get, or clear the active memory namespace (§12).
@@ -1351,8 +1396,25 @@ class AstralCoreMemoryProvider(MemoryProvider):
     # ------------------------------------------------------------------
 
     def _tool_preferences(self, args: dict, session_id: str) -> str:
-        """Manage learned user preferences (§6 consent flow)."""
+        """Manage learned user preferences (§6 consent flow).
+
+        v2.10.0: namespace="distilled" routes to the digest consent
+        surface (SPEC-DIGEST-AUTOMATION-001 §4). Approval traffic for
+        distilled claims uses ONLY /v1/memory/digest/approve (LA-1).
+        """
         action = args.get("action", "pending")
+        if args.get("namespace", "preferences") == "distilled":
+            if action in ("pending", "list"):
+                return self._digest_pending_tool()
+            if action == "approve":
+                return self._digest_transition(args, decline=False)
+            if action == "decline":
+                return self._digest_transition(args, decline=True)
+            if action == "show":
+                return json.dumps(self._http.get("/v1/memory/digest"),
+                                  indent=2, default=str)
+            return json.dumps({"error": f"Unknown digest action: {action}. "
+                               "Valid: pending, approve, decline, show"})
 
         if action == "pending":
             return self._pref_pending()
@@ -1439,6 +1501,76 @@ class AstralCoreMemoryProvider(MemoryProvider):
             "changed": result.get("changed", []),
         }, indent=2)
 
+    # v2.10.0 (SPEC-DIGEST-AUTOMATION-001 §4) — digest consent surface.
+    # Marker contract + LA-1: only /v1/memory/digest/* endpoints here.
+
+    def _digest_pending_tool(self) -> str:
+        rows = self._http.get("/v1/memory/digest/pending")
+        if isinstance(rows, dict) and "error" in rows:
+            return json.dumps({"error": rows["error"]})
+        pending = [{
+            "id": (r.get("id") or "")[:8],
+            "section": r.get("section", "memory"),
+            "kind": r.get("kind", "other"),
+            "text": r.get("text", ""),
+        } for r in (rows or [])]
+        return json.dumps({
+            "pending_count": len(pending),
+            "claims": pending,
+            "hint": ("Present each claim; approve/decline with the 8-char "
+                     "id prefix, or approve with all=true.")
+                    if pending else "No pending digest claims.",
+        }, indent=2)
+
+    def _digest_resolve_prefixes(self, prefixes: list) -> tuple:
+        """Resolve 8-char (or longer) prefixes against live pending ids.
+        Returns (resolved_full_ids, error_json_or_None). Ambiguity and
+        unknown prefixes error WITHOUT any server write (C-AC2)."""
+        rows = self._http.get("/v1/memory/digest/pending")
+        if isinstance(rows, dict) and "error" in rows:
+            return [], json.dumps({"error": rows["error"]})
+        live = [str(r.get("id") or "") for r in (rows or [])]
+        resolved = []
+        for p in prefixes:
+            p = str(p).strip()
+            if not p:
+                continue
+            hits = [i for i in live if i.startswith(p)]
+            if len(hits) == 1:
+                resolved.append(hits[0])
+            elif len(hits) > 1:
+                return [], json.dumps({
+                    "error": f"Ambiguous prefix '{p}'",
+                    "candidates": [h[:12] for h in hits]})
+            else:
+                return [], json.dumps({
+                    "error": f"Unknown pending claim id/prefix '{p}'"})
+        return resolved, None
+
+    def _digest_transition(self, args: dict, *, decline: bool) -> str:
+        """Approve/decline digest claims — ONLY via /v1/memory/digest/approve
+        (LA-1 / C-AC3). Never the generic status PATCH."""
+        if args.get("all"):
+            if decline:
+                # decline-all is almost never intended; require ids.
+                return json.dumps({"error":
+                    "decline requires explicit claim ids (no decline-all)"})
+            payload = {"all": True}
+        else:
+            raw = args.get("claim_ids") or args.get("preference_id") or ""
+            prefixes = raw if isinstance(raw, list) else [raw]
+            ids, err = self._digest_resolve_prefixes(prefixes)
+            if err:
+                return err
+            if not ids:
+                return json.dumps({"error":
+                    "claim_ids (or all=true for approve) is required"})
+            payload = {"ids": ids, "decline": True} if decline else {"ids": ids}
+        result = self._http.post("/v1/memory/digest/approve", payload)
+        if isinstance(result, dict) and "error" in result:
+            return json.dumps({"error": result["error"]})
+        return json.dumps(result, indent=2, default=str)
+
     def _pref_declare(self, args: dict) -> str:
         """Declare a user preference directly (bypasses H7 discovery)."""
         text = (args.get("text") or "").strip()
@@ -1482,14 +1614,21 @@ class AstralCoreMemoryProvider(MemoryProvider):
         # The injection block itself makes the preferences visible;
         # this note tells the agent the capability is live.
         pref_note = ""
+        digest_note = ""
         with self._state_lock:
             if getattr(self, "_last_pref_count", 0) > 0:
                 pref_note = " Preferences active (injected below)."
+            # v2.10.0 (C.2): render-once — cleared after first inclusion.
+            n = getattr(self, "_digest_note_pending", 0)
+            if n > 0:
+                digest_note = (f" [astral] {n} digest claim(s) pending "
+                               "approval — ask me to list them.")
+                self._digest_note_pending = 0
 
         return (
             "[Astral Core Memory active — surprise-gated, offline, "
             f"{self._max_recall} memories per turn."
-            f"{pref_note} "
+            f"{pref_note}{digest_note} "
             "Use astral_recall before answering from past context.]"
         )
 
@@ -1685,6 +1824,17 @@ class AstralCoreMemoryProvider(MemoryProvider):
             logger.debug("sync_turn: skipped empty turn")
             return
 
+        # v2.10.0 (D, DL-1 third layer): a turn quoting the distilled block
+        # must not re-enter the store via auto-capture. MARKER CONTRACT with
+        # astral_distillation.py DISTILL_MARKER — update in lockstep
+        # (SPEC-DIGEST-AUTOMATION-001 §5). Explicit astral_store unaffected.
+        if _DISTILL_CAPTURE_SKIP in combined:
+            with self._state_lock:
+                self._capture_skipped_distilled += 1
+            logger.debug("sync_turn: skipped distilled-marker turn: %.60s",
+                         combined.strip())
+            return
+
         sid = self._sid(session_id)
 
         # §10.1: resolve namespace for auto-capture.
@@ -1743,6 +1893,34 @@ class AstralCoreMemoryProvider(MemoryProvider):
         # writes out of on_memory_write's ingest mirror.
         if self._distill_mode == "on_turn_start" and self._distill_engine:
             self._submit(self._run_distillation)
+
+        # v2.10.0 (C.2): digest pending-approval note, TTL-gated by a
+        # persisted timestamp — turn numbers are deliberately not consulted.
+        if self._digest_notify and self._ready():
+            self._submit(self._maybe_digest_notify)
+
+    _NOTIFY_TS_PATH = Path.home() / ".hermes" / ".digest_notify_ts"
+
+    def _maybe_digest_notify(self) -> None:
+        """Background: check pending_count at most once per TTL (C.2)."""
+        try:
+            try:
+                last = float(self._NOTIFY_TS_PATH.read_text().strip())
+            except (OSError, ValueError):
+                last = 0.0
+            if (time.time() - last) < self._digest_notify_ttl:
+                return
+            data = self._http.get("/v1/memory/digest")
+            if not isinstance(data, dict) or "error" in data:
+                return  # C-AC5: unreachable → silent, debug only
+            count = int(data.get("pending_count", 0) or 0)
+            self._NOTIFY_TS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            self._NOTIFY_TS_PATH.write_text(str(time.time()))
+            if count > 0:
+                with self._state_lock:
+                    self._digest_note_pending = count
+        except Exception as e:  # noqa: BLE001
+            logger.debug("digest notify check skipped: %s", e)
 
     def on_session_switch(
         self,

@@ -88,7 +88,7 @@
 #   hermes config set memory.provider astral_memory
 
 name: astral-memory
-version: 2.9.2
+version: 2.10.0
 
 # See header: skips the 8192-byte source scan for user-installed plugins.
 kind: exclusive

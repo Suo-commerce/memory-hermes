@@ -1,0 +1,18 @@
+# Generated: 2026-09-02
+# Purpose: Nightly trigger for hermes-distill.service, 30 min after the
+#          server's scheduled digest (00:30 UTC) so approvals/carry-forward
+#          are settled (SPEC-DIGEST-AUTOMATION-001 §3, LA-6).
+#          Persistent=true: a missed 01:00 (host off) fires on next boot —
+#          asymmetric with the digest on purpose (A-AC6): render catch-up is
+#          cheap and local; digest catch-up costs an LLM call and loses
+#          nothing thanks to carry-forward.
+[Unit]
+Description=Nightly render of the approved Astral digest
+
+[Timer]
+OnCalendar=*-*-* 01:00:00 UTC
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

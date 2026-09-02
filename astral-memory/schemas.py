@@ -5,7 +5,7 @@
 #          default with the plugin (5 → 8).
 """
 Tool schemas — what the LLM reads to decide when to call Astral Core tools.
-Version: 2.8.0
+Version: 2.10.0
 
 v2.8.0 CHANGES (SPEC-PROVENANCE-AWARE-RECALL-001 P-2, SPEC-DYAD-DISTILLATION-001 A2-7/A3):
   CHG  — ASTRAL_RECALL description now explains the "provenance" tag on
@@ -256,7 +256,7 @@ ASTRAL_PREFERENCES = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["pending", "approve", "decline", "withdraw", "declare"],
+                "enum": ["pending", "approve", "decline", "withdraw", "declare", "show"],
                 "description": (
                     "pending — list nominations awaiting user consent "
                     "(returns proposed text + evidence snippets with dates); "
@@ -287,6 +287,36 @@ ASTRAL_PREFERENCES = {
                     "an instruction to you. Max 140 characters. "
                     "Example: 'Prefers one generated file per reply.' "
                     "Required for declare. Ignored for other actions."
+                ),
+            },
+            "namespace": {
+                "type": "string",
+                "enum": ["preferences", "distilled"],
+                "description": (
+                    "Default 'preferences' (H7 learned preferences — "
+                    "unchanged behavior). 'distilled' switches to the "
+                    "standing-context digest consent surface: pending "
+                    "lists claims awaiting the user's approval, "
+                    "approve/decline act on them (claim_ids or all=true "
+                    "for approve), show returns the active digest. Use "
+                    "when the user asks about pending digest claims or "
+                    "the [astral] pending-approval note appears."
+                ),
+            },
+            "claim_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Digest claim ids (8-char prefixes from pending) for "
+                    "approve/decline with namespace='distilled'. "
+                    "Ambiguous or unknown prefixes error safely."
+                ),
+            },
+            "all": {
+                "type": "boolean",
+                "description": (
+                    "With namespace='distilled' and action='approve': "
+                    "approve every pending claim. Not valid for decline."
                 ),
             },
         },
