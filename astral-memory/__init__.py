@@ -794,6 +794,7 @@ class AstralCoreMemoryProvider(MemoryProvider):
         self._digest_notify_ttl: int = 21600
         self._digest_note_pending: int = 0          # rendered-once note count
         self._capture_skipped_distilled: int = 0    # D-AC3 counter
+        self._digest_pending_ids: list = []          # C: ordered cache for list-number resolution
 
     # ------------------------------------------------------------------
     # Identity & availability
@@ -1508,33 +1509,62 @@ class AstralCoreMemoryProvider(MemoryProvider):
         rows = self._http.get("/v1/memory/digest/pending")
         if isinstance(rows, dict) and "error" in rows:
             return json.dumps({"error": rows["error"]})
+        ordered = [(r.get("id") or "") for r in (rows or [])]
+        with self._state_lock:
+            self._digest_pending_ids = ordered   # cache for list-number resolution
         pending = [{
-            "id": (r.get("id") or "")[:8],
+            "n": i + 1,
+            "id": oid[:8],
             "section": r.get("section", "memory"),
             "kind": r.get("kind", "other"),
             "text": r.get("text", ""),
-        } for r in (rows or [])]
+        } for i, (oid, r) in enumerate(zip(ordered, rows or []))]
         return json.dumps({
             "pending_count": len(pending),
             "claims": pending,
-            "hint": ("Present each claim; approve/decline with the 8-char "
-                     "id prefix, or approve with all=true.")
+            "hint": ("Present each claim numbered. The user can approve/"
+                     "decline by list number (e.g. \"approve 1 and 3\") "
+                     "or by 8-char id prefix, or approve all.")
                     if pending else "No pending digest claims.",
         }, indent=2)
 
     def _digest_resolve_prefixes(self, prefixes: list) -> tuple:
-        """Resolve 8-char (or longer) prefixes against live pending ids.
-        Returns (resolved_full_ids, error_json_or_None). Ambiguity and
-        unknown prefixes error WITHOUT any server write (C-AC2)."""
+        """Resolve list numbers (1-based), 8-char prefixes, or full ids
+        against live pending claims. Returns (resolved_full_ids,
+        error_json_or_None). Unknown refs error WITHOUT any server write.
+
+        Resolution order per token:
+          1. Small integer → 1-indexed into the cached pending list
+             (from the last _digest_pending_tool call).
+          2. Otherwise → prefix match against the live pending ids.
+        """
         rows = self._http.get("/v1/memory/digest/pending")
         if isinstance(rows, dict) and "error" in rows:
             return [], json.dumps({"error": rows["error"]})
         live = [str(r.get("id") or "") for r in (rows or [])]
+
+        # Use the cached order if available; otherwise live order.
+        with self._state_lock:
+            cached = list(self._digest_pending_ids) if self._digest_pending_ids else live
+
         resolved = []
         for p in prefixes:
             p = str(p).strip()
             if not p:
                 continue
+            # Try as list number first.
+            try:
+                n = int(p)
+                if 1 <= n <= len(cached) and cached[n - 1] in live:
+                    resolved.append(cached[n - 1])
+                    continue
+                elif 1 <= n <= 20:   # looks like a list number but out of range
+                    return [], json.dumps({
+                        "error": f"List number {n} is out of range "
+                                 f"(1-{len(cached)}). List claims first."})
+            except ValueError:
+                pass
+            # Fall back to prefix match.
             hits = [i for i in live if i.startswith(p)]
             if len(hits) == 1:
                 resolved.append(hits[0])
