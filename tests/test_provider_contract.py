@@ -1098,7 +1098,22 @@ def test_recall_medium_renders(provider, http, monkeypatch):
                         "reason": "mixed signals"}},
     ])
     out = provider.handle_tool_call("astral_recall", {"query": "budget"})
-    assert "\u26a0 medium confidence: mixed signals" in out
+    parsed = json.loads(out)
+    conf = parsed["results"][0]["confidence"]
+    assert conf == "medium: mixed signals"
+    assert "\u26a0" not in conf, "glyph is reserved for LOW (E9)"
+    assert "confidence_legend" in parsed
+
+
+def test_recall_medium_empty_reason_label_only(provider, http, monkeypatch):
+    _serve_search(http, monkeypatch, [
+        {"id": "m-med-quiet", "text": "Middling, quiet reason", "similarity": 0.5,
+         "confidence": {"score": 0.45, "label": "medium", "reason": ""}},
+    ])
+    out = provider.handle_tool_call("astral_recall", {"query": "q"})
+    parsed = json.loads(out)
+    assert parsed["results"][0]["confidence"] == "medium"
+    assert "confidence_legend" in parsed
 
 
 def test_recall_empty_reason_label_only(provider, http, monkeypatch):
@@ -1125,11 +1140,14 @@ def test_recall_feature_detect_absent_key(provider, http, monkeypatch):
     # The v2.10.0 render: provenance tag where source_role is known, the
     # legend once, and nothing else. Key order matters for a byte compare:
     # `provenance` lands after the result's own keys, `provenance_legend`
-    # after `results` — both appended, exactly as v2.10.0 did.
+    # after `results` — both appended, exactly as v2.10.0 did. The golden
+    # must mirror the render's dump kwargs exactly, including the v2.11.0
+    # ensure_ascii=False encoding change — the legend carries an em-dash,
+    # which the default escaping would render as \u2014.
     golden = json.loads(json.dumps(raw))
     golden["results"][0]["provenance"] = "[user]"
     golden["provenance_legend"] = astral_memory._PROVENANCE_LEGEND
-    assert out == json.dumps(golden, indent=2, default=str)
+    assert out == json.dumps(golden, indent=2, default=str, ensure_ascii=False)
 
 
 def test_recall_malformed_confidence(provider, http, monkeypatch):

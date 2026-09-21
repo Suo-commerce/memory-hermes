@@ -6,6 +6,16 @@
 #          (SPEC-REMEMBERING-TOUCH-001 Amendment A5 §2).
 #
 # v2.11.0 CHANGES (RT-10 — SPEC-METAMEMORY-001 v1.1 §7.1, plugin handoff):
+#   E9   — pre-deploy amendment (2026-09-21, recorded in server session
+#          E9): MEDIUM renders as a plain "medium[: reason]" label, not a
+#          warning. Measured bot-jarmo distribution (270 high / 977 medium
+#          / 91 low) put the glyph on ~80% of results, which breaks
+#          "absence of a warning is the signal" and disagrees with the
+#          server's augmented-prompt preamble (medium = neutral). The ⚠ is
+#          reserved for LOW. NEW: _CONFIDENCE_LEGEND attached to
+#          astral_recall results whenever at least one carries a rendered
+#          label (only when labelled > 0, so the no-confidence render
+#          stays byte-identical to v2.10.0).
 #   NEW  — _confidence_warning(): renders the server's RT-10 confidence
 #          label. LOW/MEDIUM → "⚠ {label} confidence: {reason}" (label
 #          only when the server ran with expose_reason: false); HIGH is
@@ -516,9 +526,14 @@ def _provenance_tag(result: Any) -> str:
 # display hint, never a filter. The plugin renders the label; it never
 # recomputes from the score (handoff spec §5).
 def _confidence_warning(result: Any) -> str:
-    """RT-10 (SPEC-METAMEMORY-001 v1.1 §7.1): LOW/MEDIUM confidence warning.
+    """RT-10 confidence render (SPEC-METAMEMORY-001 v1.1 §7.1, amended E9).
 
-    HIGH is silent — absence of a warning is the high-confidence signal.
+    LOW carries the warning glyph; MEDIUM renders as a plain label (no
+    glyph) because ~73% of the measured corpus is medium and a warning on
+    the majority is noise, and because the server preamble treats medium
+    as neutral.
+
+    HIGH is silent — the field's absence is the high-confidence signal.
     Returns "" when the result carries no usable confidence (key absent —
     pre-RT-10 server or hope.metamemory.enabled: false — or a malformed
     payload); the v2.10.0 render is then byte-identical.
@@ -529,12 +544,25 @@ def _confidence_warning(result: Any) -> str:
     if not isinstance(conf, dict):
         return ""
     label = str(conf.get("label") or "")
-    if label not in ("medium", "low"):
-        return ""
     reason = str(conf.get("reason") or "").strip()
-    if reason:
-        return f"\u26a0 {label} confidence: {reason}"
-    return f"\u26a0 {label} confidence"
+    if label == "low":
+        if reason:
+            return f"\u26a0 low confidence: {reason}"
+        return "\u26a0 low confidence"
+    if label == "medium":
+        return f"medium: {reason}" if reason else "medium"
+    return ""
+
+
+# RT-10 (E9): recall-path counterpart of the server's augmented-prompt
+# preamble, attached only when at least one result carries a rendered label
+# so the no-confidence render stays byte-identical to v2.10.0.
+_CONFIDENCE_LEGEND = (
+    "\u26a0 marks a low-confidence memory: limited or old evidence, so "
+    "mention that briefly instead of stating it as fact. 'medium' is usable "
+    "as is; prefer newer memories where they conflict. No confidence field "
+    "means well-supported by past use."
+)
 
 
 _DEFAULT_DATA_DIR = "~/.astral"
@@ -1297,21 +1325,27 @@ class AstralCoreMemoryProvider(MemoryProvider):
                         tagged += 1
                 if tagged:
                     data["provenance_legend"] = _PROVENANCE_LEGEND
-                # v2.11.0 (RT-10, SPEC-METAMEMORY-001 v1.1 §7.1): render
-                # confidence as a warning — LOW/MEDIUM carry the mandated
-                # warning string on the result; HIGH and malformed payloads
-                # are dropped so `confidence` appears only as a warning
-                # (absence of a warning IS the high-confidence signal).
-                # Results without the key (pre-RT-10 server or kill
+                # v2.11.0 (RT-10, SPEC-METAMEMORY-001 v1.1, amended E9):
+                # render confidence — LOW carries the ⚠ warning, MEDIUM a
+                # plain "medium[: reason]" label (E9: the corpus is ~73%
+                # medium; a warning on the majority is noise). HIGH and
+                # malformed payloads are dropped so the confidence field
+                # appears only as a rendered label — its absence is the
+                # high-confidence signal. Results without the key
+                # (pre-RT-10 server or kill
                 # switch) are untouched — byte-identical to v2.10.0.
+                labelled = 0
                 for r in results:
                     if not isinstance(r, dict) or "confidence" not in r:
                         continue
                     warning = _confidence_warning(r)
                     if warning:
                         r["confidence"] = warning
+                        labelled += 1
                     else:
                         r.pop("confidence", None)
+                if labelled:
+                    data["confidence_legend"] = _CONFIDENCE_LEGEND
                 # v2.9.0 (RT-13 F2): remember id→text so A1 can score
                 # evidence-use when this turn is synced.
                 self._remember_served(session_id, results)
