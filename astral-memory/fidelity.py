@@ -28,8 +28,8 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Tuple
 
 _VERSION = "0.1.0"
 
@@ -134,15 +134,15 @@ class FidelitySignal:
 
 @dataclass
 class A1Result:
-    per_memory: Dict[str, str] = field(default_factory=dict)  # id -> STRONG|WEAK|NONE
-    signals: List[FidelitySignal] = field(default_factory=list)
+    per_memory: dict[str, str] = field(default_factory=dict)  # id -> STRONG|WEAK|NONE
+    signals: list[FidelitySignal] = field(default_factory=list)
 
 
 @dataclass
 class A2Result:
     verdict: str = "NEUTRAL"   # POSITIVE | NEGATIVE | NEUTRAL
     reason: str = ""           # which rule fired
-    signals: List[FidelitySignal] = field(default_factory=list)
+    signals: list[FidelitySignal] = field(default_factory=list)
 
 
 # ── Tokenisation ─────────────────────────────────────────────────────────────
@@ -164,7 +164,7 @@ def numeral_tokens(text: str) -> set:
 # ── A1: evidence-use (same turn) ─────────────────────────────────────────────
 
 
-def classify_evidence_use(memory_text: str, response_text: str) -> Tuple[str, float]:
+def classify_evidence_use(memory_text: str, response_text: str) -> tuple[str, float]:
     """Return (STRONG|WEAK|NONE, overlap). Crude on purpose (A5 §2.2)."""
     mt = content_tokens(memory_text)
     if not mt:
@@ -207,7 +207,7 @@ def _jaccard(a: set, b: set) -> float:
     return len(a & b) / len(a | b)
 
 
-def classify_next_turn(next_user_msg: str, prev_user_msg: str) -> Tuple[str, str]:
+def classify_next_turn(next_user_msg: str, prev_user_msg: str) -> tuple[str, str]:
     """Return (POSITIVE|NEGATIVE|NEUTRAL, reason)."""
     nxt = (next_user_msg or "").strip()
     if not nxt:
@@ -251,9 +251,9 @@ def a2_next_turn(served_ids: Iterable[str], next_user_msg: str,
 # ── Payload builder (A5 §3.1) ────────────────────────────────────────────────
 
 
-def build_payload(session_id: str, turn: int, signals: List[FidelitySignal],
+def build_payload(session_id: str, turn: int, signals: list[FidelitySignal],
                   source: str, max_signals: int = 16,
-                  cosine_available: bool = False) -> Optional[dict]:
+                  cosine_available: bool = False) -> dict | None:
     """POST body for /v1/memories/fidelity, or None if nothing to send."""
     if not signals:
         return None

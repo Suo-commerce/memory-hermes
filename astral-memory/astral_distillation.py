@@ -33,12 +33,11 @@ import re
 import tempfile
 import threading
 import time
-import urllib.request
 import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Optional
 
 __version__ = "2.0.0"
 DISTILL_MARKER = f"[astral-distillation v{__version__}]"
@@ -96,7 +95,7 @@ _CFG_MEM_RE = re.compile(r"^\s*memory_char_limit\s*:\s*(\d+)", re.M)
 _CFG_USER_RE = re.compile(r"^\s*user_char_limit\s*:\s*(\d+)", re.M)
 
 
-def hermes_budgets(hermes_home: Optional[Path] = None) -> tuple:
+def hermes_budgets(hermes_home: Path | None = None) -> tuple:
     cfg = (hermes_home or Path.home() / ".hermes") / "config.yaml"
     mem, usr = DEFAULT_MEMORY_BUDGET, DEFAULT_USER_BUDGET
     try:
@@ -163,8 +162,8 @@ class Digest:
 
 class DigestClient:
     def __init__(self, base_url: str = "http://127.0.0.1:8090",
-                 api_token: Optional[str] = None,
-                 hermes_home: Optional[Path] = None,
+                 api_token: str | None = None,
+                 hermes_home: Path | None = None,
                  timeout: int = DEFAULT_TIMEOUT):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
@@ -173,7 +172,7 @@ class DigestClient:
                           or self._token_from_config(hermes_home))
 
     @staticmethod
-    def _token_from_config(hermes_home: Optional[Path]) -> str:
+    def _token_from_config(hermes_home: Path | None) -> str:
         cfg_path = (hermes_home or Path.home() / ".hermes") / "astral-memory.json"
         if cfg_path.exists():
             try:
@@ -268,10 +267,10 @@ def fit_block(claims: list, render, room: int) -> str:
 # ---------------------------------------------------------------------------
 
 class HermesAdapter:
-    def __init__(self, hermes_home: Optional[Path] = None,
-                 profile: Optional[str] = None,
-                 memory_budget: Optional[int] = None,
-                 user_budget: Optional[int] = None):
+    def __init__(self, hermes_home: Path | None = None,
+                 profile: str | None = None,
+                 memory_budget: int | None = None,
+                 user_budget: int | None = None):
         base = hermes_home or (Path.home() / ".hermes")
         cfg_mem, cfg_usr = hermes_budgets(base)
         self.memory_budget = memory_budget if memory_budget is not None else cfg_mem
@@ -307,13 +306,13 @@ class RenderResult:
     pending_count: int = 0
     files: dict = field(default_factory=dict)
     diffs: dict = field(default_factory=dict)
-    warning: Optional[str] = None
+    warning: str | None = None
 
 
 class DistillationEngine:
     def __init__(self, client: DigestClient, adapter: HermesAdapter,
                  cache_ttl: int = DEFAULT_CACHE_TTL,
-                 log_path: Optional[Path] = None,
+                 log_path: Path | None = None,
                  dry_run: bool = False):
         self.client = client
         self.adapter = adapter
@@ -334,7 +333,7 @@ class DistillationEngine:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         with self.log_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps({
-                "ts": datetime.now(timezone.utc).isoformat(),
+                "ts": datetime.now(UTC).isoformat(),
                 "marker": DISTILL_MARKER, "file": str(path), **diff,
             }) + "\n")
         return diff
@@ -469,7 +468,7 @@ def _selftest() -> int:
     adapter.memory_md.write_text(
         curated + "<!-- astral:distilled:begin [astral-distillation v1.2.4] \u2014 auto-generated, do not edit -->\n"
         "\u00a7 [user] old entry\n<!-- astral:distilled:end -->\n")
-    r3 = eng.run(force=True)
+    eng.run(force=True)
     m3 = adapter.memory_md.read_text()
     check("T7 v1.2.4 block replaced", "old entry" not in m3
           and "v2.0.0" in m3 and m3.startswith(curated))
@@ -494,7 +493,7 @@ def _selftest() -> int:
     # T10: empty digest -> block removed, pinned only
     eng.client._get = lambda p: {"memory": [], "user": [], "generation": 2,
                                  "run_id": "", "pending_count": 0}
-    r6 = eng.run(force=True)
+    eng.run(force=True)
     check("T10 empty digest -> pinned only",
           adapter.memory_md.read_text() == curated)
 

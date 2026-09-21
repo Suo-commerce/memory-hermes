@@ -5,6 +5,31 @@
 #          fields); v2.9.0 added RT-13 Layer A response-fidelity feedback
 #          (SPEC-REMEMBERING-TOUCH-001 Amendment A5 §2).
 #
+# v2.11.0 CHANGES (RT-10 — SPEC-METAMEMORY-001 v1.1 §7.1, plugin handoff):
+#   NEW  — _confidence_warning(): renders the server's RT-10 confidence
+#          label. LOW/MEDIUM → "⚠ {label} confidence: {reason}" (label
+#          only when the server ran with expose_reason: false); HIGH is
+#          silent — absence of a warning is the high-confidence signal.
+#   NEW  — _tool_recall(): a result carrying a confidence key renders it
+#          in warning form; HIGH and malformed payloads are dropped from
+#          the render so `confidence` appears only as a warning. Results
+#          without the key (pre-RT-10 server or hope.metamemory.enabled:
+#          false) are untouched — byte-identical to the v2.10.0 render
+#          (spec §7.2: feature-detect on key presence, never a value).
+#   CHG  — _tool_recall() dumps with ensure_ascii=False so the mandated
+#          ⚠ renders verbatim (spec §7.1: no emoji-policy exception);
+#          the default would escape it to \u26a0 in the output text.
+#          Encoding-only change: parsed JSON content is identical.
+#   CHG  — repo-wide lint cleanup to satisfy current ruff under the
+#          pyproject config (typing modernisation Dict/List/Optional/
+#          Tuple -> dict/list/X | None, Iterable from collections.abc,
+#          datetime.UTC, B905 zip strict=, E702, F841, isort); no
+#          behavior change.
+#   KEEP — augmented-prompt path unchanged: context_block forwards
+#          verbatim; the server embeds the inline markers and hedge
+#          instruction (verified — no plugin code parses memory lines).
+#   FIX  — version 2.10.0 -> 2.11.0 (schemas.py + plugin.yaml in step).
+#
 # v2.10.0 CHANGES (SPEC-DIGEST-AUTOMATION-001 v0.2, Components C + D):
 #   NEW  — C: astral_preferences gains namespace="distilled" — the digest
 #          consent surface, reachable from Signal chat. Actions: pending,
@@ -353,7 +378,7 @@
 #   REMOVED — nothing. tools.py deletion is a separate change.
 """
 Astral Core Memory — Hermes Agent Memory Provider Plugin
-Version: 2.4.0
+Version: 2.11.0
 
 Offline-first persistent memory with surprise-gated learning.
 Implements the MemoryProvider ABC for proper Hermes integration.
@@ -397,7 +422,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import requests
 
@@ -421,7 +446,7 @@ logger = logging.getLogger("astral-memory")
 # Constants
 # ---------------------------------------------------------------------------
 
-_VERSION = "2.10.0"
+_VERSION = "2.11.0"
 
 # --- DL-1 loop guard (SPEC astral-core-distillation-spec v1.1 §4.6) --------
 # The distillation pass derives MEMORY.md/USER.md FROM Astral Core; if
@@ -473,7 +498,8 @@ def _provenance_tag(result: Any) -> str:
     role = result.get("source_role") or meta.get("source_role") or ""
     cls = result.get("content_class") or meta.get("content_class") or ""
     intent = result.get("user_intent") or meta.get("user_intent") or ""
-    role = str(role).lower(); cls = str(cls).lower()
+    role = str(role).lower()
+    cls = str(cls).lower()
     if not role or role == "unknown":
         return ""
     if cls == "diagnostic":
@@ -483,6 +509,34 @@ def _provenance_tag(result: Any) -> str:
     if role in ("assistant", "user"):
         return f"[{role}]"
     return ""
+
+
+# v2.11.0 (RT-10, SPEC-METAMEMORY-001 v1.1 §7.1): the server's search
+# results may carry a `confidence` object {score, label, reason} — a
+# display hint, never a filter. The plugin renders the label; it never
+# recomputes from the score (handoff spec §5).
+def _confidence_warning(result: Any) -> str:
+    """RT-10 (SPEC-METAMEMORY-001 v1.1 §7.1): LOW/MEDIUM confidence warning.
+
+    HIGH is silent — absence of a warning is the high-confidence signal.
+    Returns "" when the result carries no usable confidence (key absent —
+    pre-RT-10 server or hope.metamemory.enabled: false — or a malformed
+    payload); the v2.10.0 render is then byte-identical.
+    """
+    if not isinstance(result, dict):
+        return ""
+    conf = result.get("confidence")
+    if not isinstance(conf, dict):
+        return ""
+    label = str(conf.get("label") or "")
+    if label not in ("medium", "low"):
+        return ""
+    reason = str(conf.get("reason") or "").strip()
+    if reason:
+        return f"\u26a0 {label} confidence: {reason}"
+    return f"\u26a0 {label} confidence"
+
+
 _DEFAULT_DATA_DIR = "~/.astral"
 
 _CONNECT_TIMEOUT = 3.0
@@ -522,7 +576,7 @@ class _HttpClient:
         self._api_token = api_token or ""
         self._token_loader = token_loader
 
-    def _headers(self) -> Optional[dict]:
+    def _headers(self) -> dict | None:
         if self._api_token:
             return {"Authorization": f"Bearer {self._api_token}"}
         return None
@@ -565,8 +619,8 @@ class _HttpClient:
             self._failures = 0
 
     def _request(self, method: str, path: str, *,
-                 payload: Optional[dict] = None,
-                 params: Optional[dict] = None,
+                 payload: dict | None = None,
+                 params: dict | None = None,
                  timeout: float = _REQUEST_TIMEOUT) -> dict:
         if self._circuit_open():
             return {"error": "circuit_breaker_open"}
@@ -633,18 +687,18 @@ class _HttpClient:
             self._record_failure()
             return {"error": str(e)}
 
-    def get(self, path: str, params: Optional[dict] = None,
+    def get(self, path: str, params: dict | None = None,
             timeout: float = _REQUEST_TIMEOUT) -> dict:
         return self._request("GET", path, params=params, timeout=timeout)
 
-    def post(self, path: str, payload: Optional[dict] = None,
+    def post(self, path: str, payload: dict | None = None,
              timeout: float = _REQUEST_TIMEOUT) -> dict:
         return self._request("POST", path, payload=payload or {}, timeout=timeout)
 
     def delete(self, path: str, timeout: float = _REQUEST_TIMEOUT) -> dict:
         return self._request("DELETE", path, timeout=timeout)
 
-    def health(self) -> Optional[dict]:
+    def health(self) -> dict | None:
         """Health check with a short timeout. Returns None on failure.
 
         v2.5.1: uses the PROTECTED /v1/health when a token is configured —
@@ -694,7 +748,7 @@ def _default_hermes_home() -> str:
 # Namespace validation (SPEC-NAMESPACE-001 §8.2)
 # ---------------------------------------------------------------------------
 
-def _validate_namespace(ns: str) -> Optional[str]:
+def _validate_namespace(ns: str) -> str | None:
     """Return an error message if the namespace is invalid, None if valid.
 
     Rules (§3.2): lowercase alphanumeric + hyphens only, 1-64 chars,
@@ -729,7 +783,7 @@ class AstralCoreMemoryProvider(MemoryProvider):
     """
 
     def __init__(self) -> None:
-        self._http: Optional[_HttpClient] = None
+        self._http: _HttpClient | None = None
         self._hermes_home: str = _default_hermes_home()
         self._server_url: str = _DEFAULT_SERVER_URL
         self._server_healthy: bool = False
@@ -741,24 +795,24 @@ class AstralCoreMemoryProvider(MemoryProvider):
 
         # Prefetch cache, keyed by session_id. A single shared slot leaked
         # context between concurrent gateway sessions in <= 2.1.0.
-        self._prefetch_cache: Dict[str, str] = {}
+        self._prefetch_cache: dict[str, str] = {}
 
         # Turn counters, keyed by session_id.
-        self._turn_counts: Dict[str, int] = {}
+        self._turn_counts: dict[str, int] = {}
 
         # Memory IDs injected into context this session, keyed by
         # session_id. Populated from `memory_ids` in the augmented-prompt
         # response (server >= v2.12.x); empty on older servers. Used as
         # context_manifest provenance on delegation-result ingests.
-        self._recalled_ids: Dict[str, List[str]] = {}
+        self._recalled_ids: dict[str, list[str]] = {}
 
         # v2.9.0 (RT-13 F2): id→text for memories served this session, so
         # A1 can score evidence-use. Bounded per session (last 64).
-        self._served_texts: Dict[str, Dict[str, str]] = {}
+        self._served_texts: dict[str, dict[str, str]] = {}
         # v2.9.0 (RT-13 F2): per-session pending A2 context, written by
         # sync_turn, consumed by the next on_turn_start.
         # {sid: {"turn": int, "served": [ids], "prev_user": str}}
-        self._fidelity_pending: Dict[str, Dict[str, Any]] = {}
+        self._fidelity_pending: dict[str, dict[str, Any]] = {}
 
         # Namespace state (SPEC-NAMESPACE-001 §9.1).
         # _config_namespace is loaded from `default_namespace` in config.
@@ -771,7 +825,7 @@ class AstralCoreMemoryProvider(MemoryProvider):
         # namespace params are silently omitted (§14.1).
         self._server_supports_namespace: bool = False
 
-        self._pool: Optional[ThreadPoolExecutor] = None
+        self._pool: ThreadPoolExecutor | None = None
         self._shutting_down = False
 
         # Config
@@ -780,8 +834,8 @@ class AstralCoreMemoryProvider(MemoryProvider):
         self._max_recall: int = 8          # v2.8.0: was 5
         self._capture_max_chars: int = 12000  # v2.8.0: match dyad_max_chars
         self._briefing_on_start: bool = False
-        self._min_similarity: Optional[float] = None
-        self._session_scope: Optional[str] = None  # v2.8.0 (A3-3): "verification" or None
+        self._min_similarity: float | None = None
+        self._session_scope: str | None = None  # v2.8.0 (A3-3): "verification" or None
         self._fidelity_enabled: bool = True  # v2.9.0 (RT-13 F2)
         self._data_dir: str = _DEFAULT_DATA_DIR
         self._api_token: str = ""  # v2.5.0: Bearer auth
@@ -1161,7 +1215,7 @@ class AstralCoreMemoryProvider(MemoryProvider):
     # Tools
     # ------------------------------------------------------------------
 
-    def get_tool_schemas(self) -> List[Dict[str, Any]]:
+    def get_tool_schemas(self) -> list[dict[str, Any]]:
         return [
             schemas.ASTRAL_RECALL,
             schemas.ASTRAL_STORE,
@@ -1174,7 +1228,7 @@ class AstralCoreMemoryProvider(MemoryProvider):
             schemas.ASTRAL_PREFERENCES,
         ]
 
-    def handle_tool_call(self, tool_name: str, args: Dict[str, Any],
+    def handle_tool_call(self, tool_name: str, args: dict[str, Any],
                          **kwargs) -> str:
         """Dispatch a tool call. Must return a JSON string.
 
@@ -1209,7 +1263,7 @@ class AstralCoreMemoryProvider(MemoryProvider):
             return json.dumps({"error": str(e)})
 
     def _tool_recall(self, args: dict, session_id: str) -> str:
-        payload: Dict[str, Any] = {
+        payload: dict[str, Any] = {
             "query": args.get("query", ""),
             "limit": args.get("limit", self._max_recall),
         }
@@ -1243,12 +1297,31 @@ class AstralCoreMemoryProvider(MemoryProvider):
                         tagged += 1
                 if tagged:
                     data["provenance_legend"] = _PROVENANCE_LEGEND
+                # v2.11.0 (RT-10, SPEC-METAMEMORY-001 v1.1 §7.1): render
+                # confidence as a warning — LOW/MEDIUM carry the mandated
+                # warning string on the result; HIGH and malformed payloads
+                # are dropped so `confidence` appears only as a warning
+                # (absence of a warning IS the high-confidence signal).
+                # Results without the key (pre-RT-10 server or kill
+                # switch) are untouched — byte-identical to v2.10.0.
+                for r in results:
+                    if not isinstance(r, dict) or "confidence" not in r:
+                        continue
+                    warning = _confidence_warning(r)
+                    if warning:
+                        r["confidence"] = warning
+                    else:
+                        r.pop("confidence", None)
                 # v2.9.0 (RT-13 F2): remember id→text so A1 can score
                 # evidence-use when this turn is synced.
                 self._remember_served(session_id, results)
         except Exception as e:  # never let rendering break recall
             logger.debug("provenance rendering skipped: %s", e)
-        return json.dumps(data, indent=2, default=str)
+        # v2.11.0 (RT-10): ensure_ascii=False so the mandated ⚠ renders
+        # verbatim (SPEC-METAMEMORY-001 v1.1 §7.1 — no emoji policy
+        # exception); the default escapes it to \u26a0 in the output text,
+        # which the spec's end-to-end check (handoff §4.5) would not find.
+        return json.dumps(data, indent=2, default=str, ensure_ascii=False)
 
     def _tool_store(self, args: dict, session_id: str) -> str:
         """Store the caller's text verbatim via the direct /v1/memory/add path.
@@ -1266,7 +1339,7 @@ class AstralCoreMemoryProvider(MemoryProvider):
         source = f"hermes_explicit_{session_id}" if session_id \
                  else "hermes_explicit"
 
-        payload: Dict[str, Any] = {
+        payload: dict[str, Any] = {
             "text": text,
             "category": category,
             "source": source,
@@ -1518,7 +1591,7 @@ class AstralCoreMemoryProvider(MemoryProvider):
             "section": r.get("section", "memory"),
             "kind": r.get("kind", "other"),
             "text": r.get("text", ""),
-        } for i, (oid, r) in enumerate(zip(ordered, rows or []))]
+        } for i, (oid, r) in enumerate(zip(ordered, rows or [], strict=True))]
         return json.dumps({
             "pending_count": len(pending),
             "claims": pending,
@@ -1699,7 +1772,7 @@ class AstralCoreMemoryProvider(MemoryProvider):
     def _do_prefetch(self, query: str, session_id: str) -> str:
         if not query.strip():
             return ""
-        payload: Dict[str, Any] = {
+        payload: dict[str, Any] = {
             "query": query,
             "max_memories": self._max_recall,
         }
@@ -1835,7 +1908,7 @@ class AstralCoreMemoryProvider(MemoryProvider):
         assistant_content: str,
         *,
         session_id: str = "",
-        messages: Optional[List[Dict[str, Any]]] = None,
+        messages: list[dict[str, Any]] | None = None,
     ) -> None:
         """Persist a completed turn. Must be non-blocking."""
         if not self._auto_capture or not self._ready():
@@ -1876,7 +1949,7 @@ class AstralCoreMemoryProvider(MemoryProvider):
         self._fidelity_after_turn(sid, user_content, assistant_content)
 
         def _sync() -> None:
-            payload: Dict[str, Any] = {
+            payload: dict[str, Any] = {
                 "user_message": user_content[:self._capture_max_chars],
                 "assistant_response": assistant_content[:self._capture_max_chars],
                 "source": f"hermes_{sid}" if sid else "hermes",
@@ -2004,7 +2077,7 @@ class AstralCoreMemoryProvider(MemoryProvider):
             parent_session_id or "<none>",
         )
 
-    def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
+    def on_pre_compress(self, messages: list[dict[str, Any]]) -> str:
         """Capture turns about to be discarded, and contribute to the summary.
 
         Returns text the compressor folds into its summarization prompt.
@@ -2014,7 +2087,7 @@ class AstralCoreMemoryProvider(MemoryProvider):
 
         sid = self._sid()
 
-        pairs: List[Dict[str, str]] = []
+        pairs: list[dict[str, str]] = []
         for i in range(len(messages) - 1):
             if (messages[i].get("role") == "user"
                     and messages[i + 1].get("role") == "assistant"):
@@ -2039,7 +2112,7 @@ class AstralCoreMemoryProvider(MemoryProvider):
         ns = self._resolve_namespace()
 
         def _ingest() -> None:
-            payload: Dict[str, Any] = {
+            payload: dict[str, Any] = {
                 "turns": batch,
                 "source": f"hermes_compress_{sid}" if sid else "hermes_compress",
             }
@@ -2060,7 +2133,7 @@ class AstralCoreMemoryProvider(MemoryProvider):
             "detail — preserve decisions, constraints, and open threads."
         )
 
-    def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+    def on_session_end(self, messages: list[dict[str, Any]]) -> None:
         """Generate the session episode, notify the Dreamer, write the diary.
 
         SPEC-PLUGIN-SESSION-END-002 v1.0.0. Order matters and everything
@@ -2079,7 +2152,7 @@ class AstralCoreMemoryProvider(MemoryProvider):
         sid = self._sid()
 
         # ── 1. Extract transcript turns ─────────────────────────────────
-        turns: List[Dict[str, str]] = []
+        turns: list[dict[str, str]] = []
         for msg in messages:
             role = msg.get("role", "")
             content = str(msg.get("content", "") or "").strip()
@@ -2125,7 +2198,7 @@ class AstralCoreMemoryProvider(MemoryProvider):
         else:
             logger.debug("SessionCompleted sent for session %s", sid)
 
-        lines: List[str] = []
+        lines: list[str] = []
         for msg in messages[-6:]:
             role = msg.get("role", "")
             content = str(msg.get("content", "") or "").strip()[:500]
@@ -2170,7 +2243,7 @@ class AstralCoreMemoryProvider(MemoryProvider):
         ns = self._resolve_namespace()
 
         def _ingest() -> None:
-            payload: Dict[str, Any] = {
+            payload: dict[str, Any] = {
                 "user_message": task[:self._capture_max_chars],
                 "assistant_response": result[:self._capture_max_chars],
                 "source": f"hermes_delegation_{child_session_id or sid}",
@@ -2192,7 +2265,7 @@ class AstralCoreMemoryProvider(MemoryProvider):
         action: str,
         target: str,
         content: str,
-        metadata: Optional[Dict[str, Any]] = None,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         """Mirror built-in MEMORY.md / USER.md writes into Astral Core."""
         # v2.9.2 (DL-1): distillation output is DERIVED from Astral Core —
@@ -2216,7 +2289,7 @@ class AstralCoreMemoryProvider(MemoryProvider):
         ns = self._resolve_namespace()
 
         def _mirror() -> None:
-            payload: Dict[str, Any] = {
+            payload: dict[str, Any] = {
                 "user_message": content[:self._capture_max_chars],
                 "assistant_response": f"Mirrored from Hermes {target} ({action}).",
                 "source": f"hermes_builtin_{target}",
@@ -2237,7 +2310,7 @@ class AstralCoreMemoryProvider(MemoryProvider):
     # Backup
     # ------------------------------------------------------------------
 
-    def backup_paths(self) -> List[str]:
+    def backup_paths(self) -> list[str]:
         """Declare the Astral corpus so `hermes backup` captures it.
 
         Contract: must work without initialize() and without network.
@@ -2252,7 +2325,7 @@ class AstralCoreMemoryProvider(MemoryProvider):
     # Config schema (`hermes memory setup`)
     # ------------------------------------------------------------------
 
-    def get_config_schema(self) -> List[Dict[str, Any]]:
+    def get_config_schema(self) -> list[dict[str, Any]]:
         return [
             {
                 "key": "server_url",
@@ -2336,7 +2409,7 @@ class AstralCoreMemoryProvider(MemoryProvider):
             },
         ]
 
-    def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
+    def save_config(self, values: dict[str, Any], hermes_home: str) -> None:
         """Merge into astral-memory.json rather than clobbering it."""
         path = _config_path(hermes_home)
         existing = _read_config(hermes_home)
@@ -2383,7 +2456,7 @@ class AstralCoreMemoryProvider(MemoryProvider):
 # ---------------------------------------------------------------------------
 
 # (method_name, required parameter names beyond `self`)
-_CONTRACT: Dict[str, tuple] = {
+_CONTRACT: dict[str, tuple] = {
     "prefetch":        ("query", "session_id"),
     "queue_prefetch":  ("query", "session_id"),
     "sync_turn":       ("user_content", "assistant_content", "session_id"),

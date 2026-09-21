@@ -4,6 +4,10 @@
 #          stores must reach the server verbatim, never via the extractor).
 #
 # tests/test_provider_contract.py
+# v1.3.0 — RT-10 confidence rendering tests (plugin v2.11.0,
+#          SPEC-METAMEMORY-001 v1.1 §7.1): warning on LOW/MEDIUM, silence
+#          on HIGH, label-only empty reason, feature-detect golden
+#          compare, malformed payload tolerance.
 # v1.2.0 — STORE-1: astral_store -> /v1/memory/add (plugin v2.9.1).
 #          FIX: provider fixture's _HttpClient stub now accepts the v2.5.0
 #          Bearer-auth kwargs; the suite had been erroring since then.
@@ -49,7 +53,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import pytest
 
@@ -131,9 +135,9 @@ class _FakeHttp:
 
     def __init__(self, base_url: str = "http://fake:8090"):
         self.base_url = base_url
-        self.calls: List[tuple] = []
+        self.calls: list[tuple] = []
 
-    def get(self, path: str, params: Optional[dict] = None, timeout: float = 0) -> dict:
+    def get(self, path: str, params: dict | None = None, timeout: float = 0) -> dict:
         self.calls.append(("GET", path, params))
         if path == "/v1/memory/briefing":
             return {"briefing": "BRIEFING-CARD"}
@@ -143,7 +147,7 @@ class _FakeHttp:
             return {"total_memories": 42}
         return {}
 
-    def post(self, path: str, payload: Optional[dict] = None, timeout: float = 0) -> dict:
+    def post(self, path: str, payload: dict | None = None, timeout: float = 0) -> dict:
         self.calls.append(("POST", path, payload))
         if path == "/v1/memory/augmented-prompt":
             q = (payload or {}).get("query", "")
@@ -166,10 +170,10 @@ class _FakeHttp:
             "hyde_enabled": False, "namespace_enabled": True,
         }
 
-    def paths(self, method: Optional[str] = None) -> List[str]:
+    def paths(self, method: str | None = None) -> list[str]:
         return [p for m, p, _ in self.calls if method is None or m == method]
 
-    def payload_for(self, path: str) -> Optional[dict]:
+    def payload_for(self, path: str) -> dict | None:
         for _, p, body in self.calls:
             if p == path:
                 return body
@@ -221,7 +225,7 @@ _OVERRIDES = [
 ]
 
 
-def _param_shape(func) -> List[tuple]:
+def _param_shape(func) -> list[tuple]:
     """(name, kind) pairs — ignores annotations and defaults."""
     return [(p.name, p.kind) for p in inspect.signature(func).parameters.values()]
 
@@ -387,7 +391,7 @@ def test_every_declared_tool_has_a_handler(provider):
         assert out.get("error") != f"Unknown tool: {name}", f"{name} has no handler"
 
 
-def _minimal_args(name: str) -> Dict[str, Any]:
+def _minimal_args(name: str) -> dict[str, Any]:
     return {
         "astral_recall":    {"query": "q"},
         "astral_store":     {"text": "t"},
@@ -1038,3 +1042,105 @@ def test_assert_contract_catches_the_v2_1_0_regression(caplog):
     assert any("prefetch" in m and "session_id" in m for m in messages), (
         f"guard did not name the offending method/parameter; got {messages}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 10. RT-10 confidence rendering (plugin v2.11.0, SPEC-METAMEMORY-001 v1.1)
+#
+#   The server annotates search results with a `confidence` object
+#   {score, label, reason} (absent on pre-RT-10 servers / kill switch).
+#   The plugin renders LOW/MEDIUM as the mandated warning string and is
+#   silent on HIGH; results without the key render exactly as v2.10.0.
+# ---------------------------------------------------------------------------
+
+
+def _serve_search(http, monkeypatch, results):
+    """Route /v1/memory/search to canned results (fresh copy per call)."""
+    def _post(path, payload=None, timeout=0):
+        http.calls.append(("POST", path, payload))
+        if path == "/v1/memory/search":
+            return {"results": json.loads(json.dumps(results))}
+        return _FakeHttp.post(http, path, payload, timeout)
+    monkeypatch.setattr(http, "post", _post)
+
+
+def test_recall_renders_low_confidence_warning(provider, http, monkeypatch):
+    _serve_search(http, monkeypatch, [
+        {"id": "m-low", "text": "Client discussed possible budget reduction",
+         "similarity": 0.71,
+         "confidence": {"score": 0.31, "label": "low",
+                        "reason": "single observation, 122 days old"}},
+    ])
+    out = provider.handle_tool_call("astral_recall", {"query": "budget"})
+    assert "\u26a0 low confidence: single observation, 122 days old" in out
+
+
+def test_recall_silent_on_high(provider, http, monkeypatch):
+    _serve_search(http, monkeypatch, [
+        {"id": "m-high", "text": "API rate limit is 1000 requests per hour",
+         "similarity": 0.78,
+         "confidence": {"score": 0.82, "label": "high",
+                        "reason": "well-established"}},
+    ])
+    out = provider.handle_tool_call("astral_recall", {"query": "rate limit"})
+    assert "\u26a0" not in out
+    assert "confidence" not in out, (
+        "HIGH must be silent — absence of a warning is the high-confidence "
+        "signal (SPEC-METAMEMORY-001 v1.1 §7.1)"
+    )
+
+
+def test_recall_medium_renders(provider, http, monkeypatch):
+    _serve_search(http, monkeypatch, [
+        {"id": "m-med", "text": "Budget review scheduled for Q3",
+         "similarity": 0.55,
+         "confidence": {"score": 0.52, "label": "medium",
+                        "reason": "mixed signals"}},
+    ])
+    out = provider.handle_tool_call("astral_recall", {"query": "budget"})
+    assert "\u26a0 medium confidence: mixed signals" in out
+
+
+def test_recall_empty_reason_label_only(provider, http, monkeypatch):
+    _serve_search(http, monkeypatch, [
+        {"id": "m-quiet", "text": "Quiet reason", "similarity": 0.44,
+         "confidence": {"score": 0.3, "label": "low", "reason": ""}},
+    ])
+    out = provider.handle_tool_call("astral_recall", {"query": "q"})
+    parsed = json.loads(out)
+    assert parsed["results"][0]["confidence"] == "\u26a0 low confidence"
+    assert "\u26a0 low confidence: " not in out  # no trailing colon-space
+
+
+def test_recall_feature_detect_absent_key(provider, http, monkeypatch):
+    """No confidence key → output identical to the v2.10.0 render."""
+    raw = {"results": [
+        {"id": "m-legacy-1", "text": "alpha memory", "similarity": 0.72,
+         "source_role": "user"},
+        {"id": "m-legacy-2", "text": "beta memory", "similarity": 0.41},
+    ]}
+    _serve_search(http, monkeypatch, raw["results"])
+    out = provider.handle_tool_call("astral_recall", {"query": "q"})
+
+    # The v2.10.0 render: provenance tag where source_role is known, the
+    # legend once, and nothing else. Key order matters for a byte compare:
+    # `provenance` lands after the result's own keys, `provenance_legend`
+    # after `results` — both appended, exactly as v2.10.0 did.
+    golden = json.loads(json.dumps(raw))
+    golden["results"][0]["provenance"] = "[user]"
+    golden["provenance_legend"] = astral_memory._PROVENANCE_LEGEND
+    assert out == json.dumps(golden, indent=2, default=str)
+
+
+def test_recall_malformed_confidence(provider, http, monkeypatch):
+    _serve_search(http, monkeypatch, [
+        {"id": "m-bad-1", "text": "empty object", "similarity": 0.5,
+         "confidence": {}},
+        {"id": "m-bad-2", "text": "weird label", "similarity": 0.5,
+         "confidence": {"label": "weird", "reason": "???"}},
+    ])
+    out = provider.handle_tool_call("astral_recall", {"query": "q"})
+    parsed = json.loads(out)
+    assert "confidence" not in parsed["results"][0]
+    assert "confidence" not in parsed["results"][1]
+    assert "\u26a0" not in out
