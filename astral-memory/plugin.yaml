@@ -2,6 +2,9 @@
 # Purpose: Hermes memory provider manifest — v2.9.1 tracks the STORE-1 fix
 #          (astral_store now writes verbatim via /v1/memory/add). No new
 #          tools; provides_tools/hooks unchanged. Bumped in step with _VERSION.
+# v2.11.1: RT-13 P0 — fidelity hook un-gated from the 2.10.0 capture guard
+#          (D) + INFO instrumentation. No new tools; provides_tools/hooks
+#          unchanged.
 # v2.11.0: RT-10 confidence warning on astral_recall results — no new
 #          tools; provides_tools/hooks unchanged.
 # v2.9.0: RT-13 Layer A fidelity feedback (fidelity.py + hooks).
@@ -90,7 +93,7 @@
 #   hermes config set memory.provider astral_memory
 
 name: astral-memory
-version: 2.11.0
+version: 2.11.1
 
 # See header: skips the 8192-byte source scan for user-installed plugins.
 kind: exclusive

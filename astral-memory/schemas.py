@@ -5,7 +5,11 @@
 #          default with the plugin (5 → 8).
 """
 Tool schemas — what the LLM reads to decide when to call Astral Core tools.
-Version: 2.11.0
+Version: 2.11.1
+
+v2.11.1 CHANGES (RT-13 P0, plugin v2.11.1 — sync step with __init__.py):
+  (none — no tool schemas changed; fidelity is invisible to the LLM.
+  Version header bumped in step with _VERSION per release discipline.)
 
 v2.8.0 CHANGES (SPEC-PROVENANCE-AWARE-RECALL-001 P-2, SPEC-DYAD-DISTILLATION-001 A2-7/A3):
   CHG  — ASTRAL_RECALL description now explains the "provenance" tag on

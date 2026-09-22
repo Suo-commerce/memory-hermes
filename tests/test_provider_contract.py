@@ -4,6 +4,13 @@
 #          stores must reach the server verbatim, never via the extractor).
 #
 # tests/test_provider_contract.py
+# v1.4.0 — RT-13 P0 (plugin v2.11.1): fidelity hook regression pin —
+#          the 2.10.0 capture guard (D) must gate INGEST, never the
+#          observation hooks — plus the INFO instrumentation contract
+#          (one line per hook invocation, one per POST result), and
+#          the §7 status-line /health key tests (server >= 2.16.1 keys
+#          with legacy fallback). FIX: _serve_search no longer
+#          double-appends delegated posts to http.calls.
 # v1.3.0 — RT-10 confidence rendering tests (plugin v2.11.0,
 #          SPEC-METAMEMORY-001 v1.1 §7.1): warning on LOW/MEDIUM, silence
 #          on HIGH, label-only empty reason, feature-detect golden
@@ -50,6 +57,7 @@ from __future__ import annotations
 import importlib.util
 import inspect
 import json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -1055,10 +1063,18 @@ def test_assert_contract_catches_the_v2_1_0_regression(caplog):
 
 
 def _serve_search(http, monkeypatch, results):
-    """Route /v1/memory/search to canned results (fresh copy per call)."""
+    """Route /v1/memory/search to canned results (fresh copy per call).
+
+    v1.4.0 fix: this wrapper used to append EVERY post to http.calls and
+    then delegate non-search paths to _FakeHttp.post — which appends the
+    same call again. No earlier test counted calls under this monkeypatch
+    so the duplicate entries were harmless; the RT-13 tests count fidelity
+    POSTs and must read exactly one entry per real request. Append only on
+    the path handled here; delegation stays single-append.
+    """
     def _post(path, payload=None, timeout=0):
-        http.calls.append(("POST", path, payload))
         if path == "/v1/memory/search":
+            http.calls.append(("POST", path, payload))
             return {"results": json.loads(json.dumps(results))}
         return _FakeHttp.post(http, path, payload, timeout)
     monkeypatch.setattr(http, "post", _post)
@@ -1162,3 +1178,249 @@ def test_recall_malformed_confidence(provider, http, monkeypatch):
     assert "confidence" not in parsed["results"][0]
     assert "confidence" not in parsed["results"][1]
     assert "\u26a0" not in out
+
+
+# ---------------------------------------------------------------------------
+# 11. RT-13 response fidelity (plugin v2.11.1 — P0 regression pin)
+#
+#   v2.10.0 placed the capture guard (D) ABOVE the _fidelity_after_turn call
+#   in sync_turn: a turn quoting the distilled block ("[astral-distillation
+#   v…") returned early, skipping A1 AND stashing no _fidelity_pending —
+#   which also killed the next turn's A2. No /v1/memories/fidelity POST
+#   reached the server for 18 days (2026-09-03 18:51 → 2026-09-22).
+#
+#   These pin: the hooks observe every non-empty turn (marker turns and
+#   auto-capture-off included — observation is not capture), guard D still
+#   skips the INGEST for marker turns, and the P0 instrumentation emits
+#   exactly one INFO line per hook invocation plus one per POST result.
+#
+#   fidelity.py classification logic is deliberately NOT re-tested here
+#   (it has its own self-test); these are wiring tests only.
+# ---------------------------------------------------------------------------
+
+_RT13_MEMORY = "API rate limit is 1000 requests per hour"
+
+
+def _rt13_serve_one(provider, http, monkeypatch):
+    """Serve exactly one recallable memory via the astral_recall path."""
+    _serve_search(http, monkeypatch, [
+        {"id": "m-rt13-1", "text": _RT13_MEMORY, "similarity": 0.9},
+    ])
+    provider.handle_tool_call("astral_recall", {"query": "rate limit"})
+    assert provider._served_texts.get("session-alpha", {}).get("m-rt13-1")
+
+
+def _rt13_posts(http) -> list:
+    return [b for m, p, b in http.calls if p == "/v1/memories/fidelity"]
+
+
+def test_fidelity_marker_turn_still_observed(provider, http, monkeypatch):
+    """The P0 regression (brief §P0 commit 1, item 3): a turn whose
+    user_content contains `[astral-distillation v…` must still issue a
+    fidelity POST — exactly one for that turn — while the INGEST is
+    skipped (guard D, unchanged)."""
+    _serve_search(http, monkeypatch, [
+        {"id": "m-rt13-1", "text": "Client prefers async email over meetings",
+         "similarity": 0.88},
+    ])
+    provider.handle_tool_call("astral_recall", {"query": "communication"})
+
+    # Gateway-style user turn: the Signal message quotes the distilled
+    # block back (the digest-consent flow makes this routine on bot-jarmo).
+    marker_user_msg = (
+        "why does my digest still say this?\n"
+        "<!-- astral:distilled:begin [astral-distillation v1.2.0] — "
+        "auto-generated, do not edit -->\n"
+        "- Client prefers async email over meetings\n"
+        "<!-- astral:distilled:end -->"
+    )
+    provider.sync_turn(
+        marker_user_msg,
+        "You prefer async email over meetings, so the digest keeps it "
+        "as a standing claim.",
+    )
+
+    # Guard D intact: the marker turn must NOT re-enter the store...
+    assert "/v1/memory/ingest" not in http.paths("POST")
+    assert provider._capture_skipped_distilled == 1
+    # ...but the A2 context must have been stashed anyway.
+    pending = provider._fidelity_pending.get("session-alpha")
+    assert pending is not None, (
+        "guard (D) must not gate _fidelity_pending — its early return is "
+        "what silenced RT-13 for 18 days"
+    )
+    assert pending["served"] == ["m-rt13-1"]
+
+    provider.on_turn_start(2, "Thanks, what about the user file?")
+    _drain(provider)
+
+    fid = _rt13_posts(http)
+    # Exactly one POST for the marker turn (A1) + one for the follow-up
+    # (A2) — no more, no less.
+    assert len(fid) == 2, [b for _, p, b in http.calls if p == "/v1/memories/fidelity"]
+    layers = {s["layer"] for body in fid for s in body["signals"]}
+    assert layers == {"A1", "A2"}
+    for body in fid:
+        assert body["session_id"] == "session-alpha"
+        assert body["source"] == f"hermes-{astral_memory._VERSION}"
+        assert body["cosine_available"] is False
+        assert {s["memory_id"] for s in body["signals"]} == {"m-rt13-1"}
+        assert all("text" not in s for s in body["signals"]), (
+            "payload is ids-only (A5 §2.4: never memory text)"
+        )
+
+
+def test_fidelity_observed_with_auto_capture_off(provider, http, monkeypatch):
+    """Observation is not capture: auto_capture=false silences the ingest,
+    never the fidelity channel (it has its own `fidelity` config gate)."""
+    provider._auto_capture = False
+    _rt13_serve_one(provider, http, monkeypatch)
+
+    provider.sync_turn("what's the API rate limit?",
+                       "The API rate limit is 1000 requests per hour.")
+    provider.on_turn_start(2, "Thanks, what about retries?")
+    _drain(provider)
+
+    assert "/v1/memory/ingest" not in http.paths("POST")
+    assert _rt13_posts(http), (
+        "fidelity must observe turns even when auto-capture is disabled"
+    )
+
+
+def test_fidelity_info_one_line_per_hook_invocation(
+        provider, http, monkeypatch, caplog):
+    """P0 instrumentation: exactly one INFO line per hook invocation
+    (session, turn, signals) and one on each POST result. An 18-day
+    silence must be visible without debug logging."""
+    with caplog.at_level(logging.INFO, logger="astral-memory"):
+        _rt13_serve_one(provider, http, monkeypatch)
+
+        provider.on_turn_start(1, "what's the API rate limit?")
+        provider.sync_turn("what's the API rate limit?",
+                           "The API rate limit is 1000 requests per hour.")
+        provider.on_turn_start(2, "Thanks, what about retries?")
+        _drain(provider)
+
+    lines = [r.getMessage() for r in caplog.records
+             if r.levelno == logging.INFO and "rt13_fidelity" in r.getMessage()]
+    after = [l for l in lines if "hook=after_turn" in l]
+    nxt = [l for l in lines if "hook=next_turn" in l]
+    posts = [l for l in lines if l.startswith("rt13_fidelity: post ")]
+
+    # One line per invocation: 1x sync_turn, 2x on_turn_start.
+    assert len(after) == 1, lines
+    assert len(nxt) == 2, lines
+    assert len(posts) == 2, lines  # A1 same-turn + A2 next-turn
+
+    assert "session=session-alpha" in after[0]
+    assert "turn=1" in after[0]
+    assert "served=1" in after[0]
+    assert "signals=1" in after[0]
+
+    assert "session=session-alpha" in nxt[1]
+    assert "verdict=POSITIVE" in nxt[1]
+    assert "signals=1" in nxt[1]
+    # The no-pending signature — the exact smoke the P0 left behind: the
+    # hook fires but the sync_turn-side stash never happened.
+    assert "verdict=no_pending" in nxt[0]
+
+    assert all("result=ok" in l and "signals=1" in l for l in posts)
+
+
+def test_fidelity_hook_line_when_nothing_served(provider, http, caplog):
+    """The hook line fires even when nothing was served — 'hook alive,
+    zero served' must be distinguishable from 'hook never invoked'."""
+    with caplog.at_level(logging.INFO, logger="astral-memory"):
+        provider.sync_turn("hello there", "hi!")
+    _drain(provider)
+
+    lines = [r.getMessage() for r in caplog.records
+             if r.levelno == logging.INFO and "hook=after_turn" in r.getMessage()]
+    assert len(lines) == 1
+    assert "served=0" in lines[0] and "signals=0" in lines[0]
+    assert "/v1/memories/fidelity" not in http.paths("POST")
+
+
+def test_fidelity_post_error_logged_at_info(provider, http, monkeypatch, caplog):
+    """A rejected POST gets its result line too — failures were invisible
+    at the old DEBUG level."""
+    def _post(path, payload=None, timeout=0):
+        # NOTE: installed AFTER _rt13_serve_one so this wrapper wins over
+        # _serve_search's routing for the fidelity path.
+        if path == "/v1/memories/fidelity":
+            http.calls.append(("POST", path, payload))
+            return {"error": "fidelity disabled server-side"}
+        return _FakeHttp.post(http, path, payload, timeout)
+
+    with caplog.at_level(logging.INFO, logger="astral-memory"):
+        _rt13_serve_one(provider, http, monkeypatch)
+        monkeypatch.setattr(http, "post", _post)
+        provider.on_turn_start(1, "what's the API rate limit?")
+        provider.sync_turn("what's the API rate limit?",
+                           "The API rate limit is 1000 requests per hour.")
+        _drain(provider)
+
+    posts = [r.getMessage() for r in caplog.records
+             if r.levelno == logging.INFO
+             and r.getMessage().startswith("rt13_fidelity: post ")]
+    assert len(posts) == 1
+    assert "result=error" in posts[0]
+    assert "fidelity disabled server-side" in posts[0]
+
+
+# ---------------------------------------------------------------------------
+# 12. Status line /health keys (plugin v2.11.1, §7 of the 2026-09-21 brief)
+#
+#   Server >= 2.16.1 /health carries `embedding` ("onnx:1024"), `hyde`,
+#   `deep_rerank`, `temporal_retrieval`, `metamemory`. The plugin printed
+#   embedding=?, rerank=off, hyde=off against it. It must read the new
+#   keys first and fall back to the legacy ones for older servers.
+# ---------------------------------------------------------------------------
+
+
+def test_status_line_reads_server_2161_health_keys(
+        monkeypatch, tmp_path, http, caplog):
+    class _NewHealth(_FakeHttp):
+        def health(self):
+            return {
+                "status": "ok", "version": "2.16.1", "total_memories": 1234,
+                "embedding": "onnx:1024", "hyde": True, "deep_rerank": True,
+                "temporal_retrieval": True, "metamemory": True,
+                "namespace_enabled": True,
+            }
+
+    monkeypatch.setattr(astral_memory, "_HttpClient",
+                        lambda url, *a, **kw: _NewHealth())
+    p = AstralCoreMemoryProvider()
+    with caplog.at_level(logging.INFO, logger="astral-memory"):
+        p.initialize("s", hermes_home=str(tmp_path))
+    p.shutdown()
+
+    lines = [r.getMessage() for r in caplog.records
+             if "Astral Core Memory v" in r.getMessage()]
+    assert len(lines) == 1
+    # §7 acceptance: embedding=onnx:1024, rerank=on, hyde=on.
+    assert "embedding=onnx:1024" in lines[0]
+    assert "rerank=on" in lines[0]
+    assert "hyde=on" in lines[0]
+    assert "temporal=on" in lines[0]
+    assert "metamemory=on" in lines[0]
+
+
+def test_status_line_falls_back_to_legacy_health_keys(
+        monkeypatch, tmp_path, http, caplog):
+    """_FakeHttp.health() carries only the legacy keys — the render must
+    be unchanged for pre-2.16.1 servers (embedding_backend, …_enabled)."""
+    monkeypatch.setattr(astral_memory, "_HttpClient",
+                        lambda url, *a, **kw: http)
+    p = AstralCoreMemoryProvider()
+    with caplog.at_level(logging.INFO, logger="astral-memory"):
+        p.initialize("s", hermes_home=str(tmp_path))
+    p.shutdown()
+
+    lines = [r.getMessage() for r in caplog.records
+             if "Astral Core Memory v" in r.getMessage()]
+    assert len(lines) == 1
+    assert "embedding=fake" in lines[0]
+    assert "rerank=off" in lines[0]
+    assert "hyde=off" in lines[0]

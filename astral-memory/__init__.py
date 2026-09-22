@@ -1,9 +1,47 @@
-# Generation Timestamp: 2026-08-25T12:00:00Z
+# Generation Timestamp: 2026-09-22T00:00:00Z
 # Purpose: Hermes memory plugin — v2.9.1 routes astral_store to the direct
 #          /v1/memory/add endpoint so explicit stores land verbatim (no
 #          dyad extraction, no surprise gate, category + namespace as real
 #          fields); v2.9.0 added RT-13 Layer A response-fidelity feedback
 #          (SPEC-REMEMBERING-TOUCH-001 Amendment A5 §2).
+#
+# v2.11.1 CHANGES (RT-13 P0 — fidelity hook silent since 2.10.0):
+#   FIX  — sync_turn(): the v2.10.0 capture guard (D) sat ABOVE the RT-13
+#          _fidelity_after_turn call. A turn quoting the distilled block
+#          ("[astral-distillation v…") returned early, skipping A1 for the
+#          turn AND stashing no _fidelity_pending — so the next turn's A2
+#          no-opped too. Last server-side fidelity_observed 2026-09-03
+#          18:51; no /v1/memories/fidelity POST for 18 days. The hook now
+#          runs on every non-empty completed turn, BEFORE all capture
+#          gates (auto_capture, server-ready, guard D): fidelity is
+#          id-only observation with its own config gate (`fidelity`) and
+#          the server's observation_mode as the safety — capture gates
+#          govern INGEST, never observation. Guard D still skips the
+#          ingest for marker turns (unchanged); the D-AC3 counter still
+#          counts them.
+#   NEW  — RT-13 instrumentation at INFO (P0 requirement): exactly one
+#          line per hook invocation — "rt13_fidelity: hook=after_turn
+#          session=… turn=… served=… signals=…" and "rt13_fidelity:
+#          hook=next_turn session=… turn=… verdict=… signals=…" (verdict
+#          no_pending = the sync_turn-side stash never happened) — and
+#          one on each POST result ("rt13_fidelity: post session=…
+#          turn=… signals=… result=ok|error …"). An 18-day silence is
+#          now visible without debug logging. fidelity.py classification
+#          logic untouched.
+#   CHG  — every exit on the sync_turn/fidelity path is INFO, not DEBUG
+#          (§7 of the 2026-09-21 brief): `sync_turn: skipped empty turn`,
+#          `sync_turn: skipped distilled-marker turn` (the line commit 2
+#          of the brief decides on), `fidelity A1/A2 skipped: …`. A1
+#          per-memory verdicts and the A2 reason stay DEBUG — the hook
+#          INFO line already summarises them, and the brief's obs
+#          pipeline counts one line per invocation.
+#   FIX  — status line reads the server >= 2.16.1 /health keys
+#          (`embedding`, `hyde`, `deep_rerank`, `temporal_retrieval`,
+#          `metamemory`) with fallback to the legacy
+#          embedding_backend/deep_rerank_enabled/hyde_enabled keys, so
+#          it no longer prints embedding=?, rerank=off, hyde=off against
+#          a server that has all of them on (§7).
+#   FIX  — version 2.11.0 -> 2.11.1 (schemas.py + plugin.yaml in step).
 #
 # v2.11.0 CHANGES (RT-10 — SPEC-METAMEMORY-001 v1.1 §7.1, plugin handoff):
 #   E9   — pre-deploy amendment (2026-09-21, recorded in server session
@@ -456,7 +494,7 @@ logger = logging.getLogger("astral-memory")
 # Constants
 # ---------------------------------------------------------------------------
 
-_VERSION = "2.11.0"
+_VERSION = "2.11.1"
 
 # --- DL-1 loop guard (SPEC astral-core-distillation-spec v1.1 §4.6) --------
 # The distillation pass derives MEMORY.md/USER.md FROM Astral Core; if
@@ -935,16 +973,27 @@ class AstralCoreMemoryProvider(MemoryProvider):
                     "(config default_namespace='%s' ignored)",
                     self._config_namespace,
                 )
+            # v2.11.1 (§7 of the 2026-09-21 brief): server >= 2.16.1 /health
+            # carries `embedding` (e.g. "onnx:1024"), `hyde`, `deep_rerank`,
+            # `temporal_retrieval`, `metamemory`. Read those first and fall
+            # back to the legacy keys (embedding_backend / deep_rerank_enabled
+            # / hyde_enabled) so older servers render as before.
+            emb = health.get("embedding") or health.get("embedding_backend") or "?"
+            hyde = health.get("hyde", health.get("hyde_enabled"))
+            rerank = health.get("deep_rerank", health.get("deep_rerank_enabled"))
             logger.info(
                 "Astral Core Memory v%s: %s (server v%s) — %d memories, "
-                "embedding=%s, rerank=%s, hyde=%s, namespace=%s",
+                "embedding=%s, rerank=%s, hyde=%s, temporal=%s, "
+                "metamemory=%s, namespace=%s",
                 _VERSION,
                 health.get("status", "?"),
                 health.get("version", "?"),
                 health.get("total_memories", 0),
-                health.get("embedding_backend", "?"),
-                "on" if health.get("deep_rerank_enabled") else "off",
-                "on" if health.get("hyde_enabled") else "off",
+                emb,
+                "on" if rerank else "off",
+                "on" if hyde else "off",
+                "on" if health.get("temporal_retrieval") else "off",
+                "on" if health.get("metamemory") else "off",
                 "on" if self._server_supports_namespace else "off",
             )
         else:
@@ -1162,12 +1211,24 @@ class AstralCoreMemoryProvider(MemoryProvider):
 
         def _send() -> None:
             r = self._http.post("/v1/memories/fidelity", payload)
+            n = len(payload.get("signals", []))
             if "error" in r:
-                logger.debug("fidelity POST failed (non-fatal): %s", r["error"])
+                # v2.11.1 (RT-13 P0): POST result at INFO — an 18-day
+                # silence must be visible without debug logging.
+                logger.info(
+                    "rt13_fidelity: post session=%s turn=%s signals=%d "
+                    "result=error error=%s",
+                    sid, turn, n, str(r["error"])[:120],
+                )
             else:
-                logger.debug("fidelity: applied=%s logged=%s obs=%s rejected=%s",
-                             r.get("applied"), r.get("logged"),
-                             r.get("observation_mode"), len(r.get("rejected") or []))
+                logger.info(
+                    "rt13_fidelity: post session=%s turn=%s signals=%d "
+                    "result=ok applied=%s logged=%s observation_mode=%s "
+                    "rejected=%d",
+                    sid, turn, n, r.get("applied"), r.get("logged"),
+                    r.get("observation_mode"),
+                    len(r.get("rejected") or []),
+                )
 
         self._submit(_send)
 
@@ -1192,15 +1253,27 @@ class AstralCoreMemoryProvider(MemoryProvider):
                     "served": served_ids,
                     "prev_user": (user_content or "")[:2000],
                 }
-            if not served_ids:
-                return
-            served = [_fidelity.ServedMemory(i, texts.get(i, "")) for i in served_ids]
-            a1 = _fidelity.a1_evidence_use(served, assistant_content or "")
-            logger.debug("fidelity A1 turn=%s served=%d verdicts=%s",
-                         turn, len(served_ids), a1.per_memory)
-            self._fidelity_post(sid, turn, a1.signals)
+            n_signals = 0
+            if served_ids:
+                served = [_fidelity.ServedMemory(i, texts.get(i, ""))
+                          for i in served_ids]
+                a1 = _fidelity.a1_evidence_use(served, assistant_content or "")
+                n_signals = len(a1.signals)
+                logger.debug("fidelity A1 turn=%s served=%d verdicts=%s",
+                             turn, len(served_ids), a1.per_memory)
+                self._fidelity_post(sid, turn, a1.signals)
+            # v2.11.1 (RT-13 P0): exactly one INFO line per invocation —
+            # proves the hook fired and what it saw, even when the turn
+            # produced no signals.
+            logger.info(
+                "rt13_fidelity: hook=after_turn session=%s turn=%s "
+                "served=%d signals=%d",
+                sid, turn, len(served_ids), n_signals,
+            )
         except Exception as e:  # noqa: BLE001 — never let feedback kill a turn
-            logger.debug("fidelity A1 skipped: %s", e)
+            # v2.11.1 (§7): an exception inside the hook must be visible in
+            # production — this exit was DEBUG during the 18-day silence.
+            logger.info("fidelity A1 skipped: %s", e)
 
     def _fidelity_next_turn(self, sid: str, message: str) -> None:
         """A2 (continuation/correction) for the previous turn's served ids."""
@@ -1209,15 +1282,31 @@ class AstralCoreMemoryProvider(MemoryProvider):
         try:
             with self._state_lock:
                 pending = self._fidelity_pending.pop(sid, None)
-            if not pending or not pending.get("served"):
-                return
-            a2 = _fidelity.a2_next_turn(pending["served"], message or "",
-                                        pending.get("prev_user", ""))
-            logger.debug("fidelity A2 turn=%s verdict=%s reason=%s",
-                         pending["turn"], a2.verdict, a2.reason)
-            self._fidelity_post(sid, int(pending["turn"]), a2.signals)
+                turn_now = int(self._turn_counts.get(sid, 0))
+            verdict = "no_pending"
+            n_signals = 0
+            turn = turn_now
+            if pending and pending.get("served"):
+                turn = int(pending["turn"])
+                a2 = _fidelity.a2_next_turn(pending["served"], message or "",
+                                            pending.get("prev_user", ""))
+                verdict = a2.verdict
+                n_signals = len(a2.signals)
+                logger.debug("fidelity A2 turn=%s verdict=%s reason=%s",
+                             turn, a2.verdict, a2.reason)
+                self._fidelity_post(sid, turn, a2.signals)
+            # v2.11.1 (RT-13 P0): exactly one INFO line per invocation —
+            # "no_pending" is the signature of the sync_turn-side hook being
+            # gated (2.10.0 capture guard regression); it must be visible
+            # at INFO, not only as silence.
+            logger.info(
+                "rt13_fidelity: hook=next_turn session=%s turn=%s "
+                "verdict=%s signals=%d",
+                sid, turn, verdict, n_signals,
+            )
         except Exception as e:  # noqa: BLE001
-            logger.debug("fidelity A2 skipped: %s", e)
+            # v2.11.1 (§7): same as the A1 exit — never a silent DEBUG.
+            logger.info("fidelity A2 skipped: %s", e)
 
     def _ready(self) -> bool:
         return self._http is not None
@@ -1945,8 +2034,7 @@ class AstralCoreMemoryProvider(MemoryProvider):
         messages: list[dict[str, Any]] | None = None,
     ) -> None:
         """Persist a completed turn. Must be non-blocking."""
-        if not self._auto_capture or not self._ready():
-            return
+        sid = self._sid(session_id)
 
         # v2.7.1 (N-10a fix): the v2.3.0 8-word pre-filter is removed. It was
         # added to shield Dreamer episode generation from noise, but short
@@ -1957,8 +2045,31 @@ class AstralCoreMemoryProvider(MemoryProvider):
         # word count punches holes in the raw-turn spool's completeness
         # guarantee. Only genuinely empty turns are skipped.
         combined = f"{user_content} {assistant_content}"
+
+        # v2.11.1 (RT-13 P0, 2026-09-22): fidelity Layer A must observe
+        # every completed turn, BEFORE any capture gate. The v2.10.0 capture
+        # guard (D) sat ABOVE the hook call: a turn quoting the distilled
+        # block returned early, so A1 was skipped AND _fidelity_pending was
+        # never stashed — which also killed the next turn's A2. No
+        # /v1/memories/fidelity POST reached the server for 18 days
+        # (2026-09-03 18:51 → 2026-09-22). Fidelity is id-only observation
+        # (the server's observation_mode is the safety); the gates below
+        # govern INGEST and must never gate it. Empty turns are still
+        # skipped — there is nothing to observe.
+        if combined.strip():
+            # v2.9.0 (RT-13 F2): snapshot the served ids NOW (prefetch for
+            # the next turn will overwrite them), score A1 against the
+            # assistant text, and stash the A2 context.
+            self._fidelity_after_turn(sid, user_content, assistant_content)
+
+        if not self._auto_capture or not self._ready():
+            return
+
         if not combined.strip():
-            logger.debug("sync_turn: skipped empty turn")
+            # v2.11.1 (§7 of the 2026-09-21 brief): every exit on this path
+            # was DEBUG — production showed nothing while fidelity went
+            # silent for 18 days. INFO, like all sync_turn exits.
+            logger.info("sync_turn: skipped empty turn")
             return
 
         # v2.10.0 (D, DL-1 third layer): a turn quoting the distilled block
@@ -1968,19 +2079,15 @@ class AstralCoreMemoryProvider(MemoryProvider):
         if _DISTILL_CAPTURE_SKIP in combined:
             with self._state_lock:
                 self._capture_skipped_distilled += 1
-            logger.debug("sync_turn: skipped distilled-marker turn: %.60s",
-                         combined.strip())
+            # v2.11.1: INFO because commit 2 of the 2026-09-21 brief decides
+            # on this line — whether guard (D) fires on ordinary turns is
+            # only readable from production logs if it is not DEBUG.
+            logger.info("sync_turn: skipped distilled-marker turn: %.60s",
+                        combined.strip())
             return
-
-        sid = self._sid(session_id)
 
         # §10.1: resolve namespace for auto-capture.
         ns = self._resolve_namespace()
-
-        # v2.9.0 (RT-13 F2): fidelity Layer A, same turn. Snapshot the
-        # served ids NOW (prefetch for the next turn will overwrite them),
-        # score A1 against the assistant text, and stash the A2 context.
-        self._fidelity_after_turn(sid, user_content, assistant_content)
 
         def _sync() -> None:
             payload: dict[str, Any] = {
