@@ -1,4 +1,5 @@
 # Generation Timestamp: 2026-09-22T00:00:00Z
+# Hermes MemoryProvider plugin — register_memory_provider entry point
 # Purpose: Hermes memory plugin — v2.9.1 routes astral_store to the direct
 #          /v1/memory/add endpoint so explicit stores land verbatim (no
 #          dyad extraction, no surprise gate, category + namespace as real
@@ -426,7 +427,7 @@
 #   REMOVED — nothing. tools.py deletion is a separate change.
 """
 Astral Core Memory — Hermes Agent Memory Provider Plugin
-Version: 2.11.0
+Version: 2.11.2
 
 Offline-first persistent memory with surprise-gated learning.
 Implements the MemoryProvider ABC for proper Hermes integration.
@@ -468,6 +469,7 @@ import logging
 import os
 import threading
 import time
+import contextvars
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -494,7 +496,7 @@ logger = logging.getLogger("astral-memory")
 # Constants
 # ---------------------------------------------------------------------------
 
-_VERSION = "2.11.1"
+_VERSION = "2.11.2"
 
 # --- DL-1 loop guard (SPEC astral-core-distillation-spec v1.1 §4.6) --------
 # The distillation pass derives MEMORY.md/USER.md FROM Astral Core; if
@@ -935,6 +937,7 @@ class AstralCoreMemoryProvider(MemoryProvider):
 
     def initialize(self, session_id: str, **kwargs) -> None:
         self._hermes_home = kwargs.get("hermes_home") or _default_hermes_home()
+        self._agent_context = kwargs.get("agent_context", "primary")
         self._load_config()
 
         with self._state_lock:
@@ -1169,7 +1172,8 @@ class AstralCoreMemoryProvider(MemoryProvider):
         if self._pool is None or self._shutting_down:
             return
         try:
-            self._pool.submit(fn, *args, **kwargs)
+            ctx = contextvars.copy_context()
+            self._pool.submit(ctx.run, fn, *args, **kwargs)
         except RuntimeError:
             # Pool already shut down mid-turn.
             pass
@@ -2061,6 +2065,12 @@ class AstralCoreMemoryProvider(MemoryProvider):
             # the next turn will overwrite them), score A1 against the
             # assistant text, and stash the A2 context.
             self._fidelity_after_turn(sid, user_content, assistant_content)
+
+        # v2.11.2: skip auto-capture for cron and subagent contexts.
+        # Fidelity observation (above) still runs — it is id-only and safe.
+        if getattr(self, "_agent_context", "primary") not in ("primary", ""):
+            logger.info("sync_turn: skipped — agent_context=%s", self._agent_context)
+            return
 
         if not self._auto_capture or not self._ready():
             return
