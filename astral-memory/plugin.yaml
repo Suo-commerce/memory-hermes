@@ -1,7 +1,18 @@
-# Generation Timestamp: 2026-08-25T12:45:00Z
-# Purpose: Hermes memory provider manifest — v2.9.1 tracks the STORE-1 fix
-#          (astral_store now writes verbatim via /v1/memory/add). No new
-#          tools; provides_tools/hooks unchanged. Bumped in step with _VERSION.
+# Generation Timestamp: 2026-10-13T21:15:00Z
+# Purpose: Hermes memory provider manifest — v2.12.0 tracks the behaviour
+#          release: live-turn prefetch (prefetch_mode), relevance inject
+#          floor (inject_floor), T0 vacuity pre-filter (t0_vacuity_filter),
+#          astral_forget by memory_id / query, turn-scoped RT-13 served set,
+#          automatic-distillation construction fix. No new tools or hooks;
+#          provides_tools/hooks unchanged. Bumped in step with _VERSION.
+# v2.12.0: three new optional config keys in astral-memory.json —
+#          prefetch_mode ("live" default | "warm" = 2.11.x rollback),
+#          inject_floor (0-1, default 0 = off), t0_vacuity_filter (default
+#          true). Plugin-side keys, not env vars: requires_env stays empty.
+#          astral_forget schema widened (memory_id, query, source); the
+#          tool name is unchanged so provides_tools is unchanged.
+# v2.11.3: F1 prefetch instrumentation — "astral_prefetch:" INFO lines only;
+#          zero behaviour change. No new tools; provides_tools/hooks unchanged.
 # v2.11.1: RT-13 P0 — fidelity hook un-gated from the 2.10.0 capture guard
 #          (D) + INFO instrumentation. No new tools; provides_tools/hooks
 #          unchanged.
@@ -93,7 +104,7 @@
 #   hermes config set memory.provider astral_memory
 
 name: astral_memory
-version: 2.11.2
+version: 2.12.0
 
 # See header: skips the 8192-byte source scan for user-installed plugins.
 kind: exclusive
@@ -104,8 +115,9 @@ description: >
   questions), hybrid lexical+semantic
   retrieval, in-process multilingual cross-encoder reranking, provenance-
   tagged recall ([user]/[dyad]/[assistant]/[diagnostic]), HyDE query
-  expansion, session diary, and fleet sync. No API keys required. The only
-  Hermes memory provider that works completely offline.
+  expansion, live-turn auto-recall with an optional relevance floor,
+  per-memory forget, session diary, and fleet sync. No API keys required.
+  The only Hermes memory provider that works completely offline.
 
 author: Suocommerce
 homepage: https://github.com/Suo-commerce/memory-hermes

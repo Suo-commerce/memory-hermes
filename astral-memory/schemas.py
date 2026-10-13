@@ -1,11 +1,30 @@
-# Generation Timestamp: 2026-08-17T09:10:00Z
+# Generation Timestamp: 2026-10-13T21:00:00Z
 # Purpose: Tool schemas the LLM reads to decide when to call Astral Core tools —
-#          v2.8.0 teaches the agent to read provenance tags on recall results
-#          (SPEC-PROVENANCE-AWARE-RECALL-001 P-2) and aligns the recall limit
-#          default with the plugin (5 → 8).
+#          v2.12.0 extends astral_forget to forget one memory by id and to
+#          look up candidates by query (never deleting on a query); v2.8.0
+#          taught the agent to read provenance tags on recall results
+#          (SPEC-PROVENANCE-AWARE-RECALL-001 P-2).
 """
 Tool schemas — what the LLM reads to decide when to call Astral Core tools.
-Version: 2.11.1
+Version: 2.12.0
+
+v2.12.0 CHANGES (plugin v2.12.0 — sync step with __init__.py):
+  CHG  — ASTRAL_FORGET: `source` is no longer required. New optional
+         `memory_id` (delete exactly one memory) and `query` (look up
+         candidates; returns ids + excerpts, deletes nothing). The
+         description teaches the two-step flow the plugin enforces:
+         query → show the user the candidates → confirm → call again
+         with memory_id. Exactly one of memory_id / source / query is
+         expected; memory_id wins if several are given. Memory ids are
+         visible in astral_recall results and in the id="…" attribute
+         of auto-recalled <memory> blocks.
+  (no other schema changes — prefetch_mode, inject_floor and the T0
+   vacuity filter are invisible to the LLM.)
+
+v2.11.3 CHANGES (F1 prefetch instrumentation, plugin v2.11.3 — sync step
+  with __init__.py):
+  (none — logging only, invisible to the LLM. Version header bumped in
+  step with _VERSION per release discipline.)
 
 v2.11.1 CHANGES (RT-13 P0, plugin v2.11.1 — sync step with __init__.py):
   (none — no tool schemas changed; fidelity is invisible to the LLM.
@@ -117,18 +136,47 @@ ASTRAL_STORE = {
 ASTRAL_FORGET = {
     "name": "astral_forget",
     "description": (
-        "Delete all memories from a specific source. Use when the user asks "
-        "to forget imported data or a specific session's memories."
+        "Forget memories. Three modes — pass exactly one argument. "
+        "memory_id: permanently delete ONE memory by its id (ids appear in "
+        "astral_recall results and in the id=\"…\" attribute of auto-"
+        "recalled <memory> blocks). "
+        "query: look up which memories match what the user wants forgotten; "
+        "returns up to 5 candidates with ids and excerpts and deletes "
+        "NOTHING — show them to the user, let them pick, then call again "
+        "with memory_id. "
+        "source: delete every memory from a source (e.g. an imported file "
+        "or a whole session, 'hermes_session_42') — broad, use only when "
+        "the user clearly means all of it. "
+        "When the user says 'forget that' or 'that's wrong, delete it' and "
+        "you can see the id in context, use memory_id directly; when you "
+        "cannot, use query first. Deletion is irreversible."
     ),
     "parameters": {
         "type": "object",
         "properties": {
+            "memory_id": {
+                "type": "string",
+                "description": (
+                    "Id of the single memory to delete. Takes precedence "
+                    "over source and query if several are given."
+                ),
+            },
+            "query": {
+                "type": "string",
+                "description": (
+                    "Natural-language description of what to forget. Returns "
+                    "candidate memories (id, excerpt, score, provenance); "
+                    "never deletes."
+                ),
+            },
             "source": {
                 "type": "string",
-                "description": "Source identifier to delete (e.g. 'hermes_session_42')",
+                "description": (
+                    "Source identifier to delete entirely "
+                    "(e.g. 'hermes_session_42')."
+                ),
             },
         },
-        "required": ["source"],
     },
 }
 

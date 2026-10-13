@@ -1,9 +1,16 @@
-# Generation Timestamp: 2026-08-25T12:30:00Z
+# Generation Timestamp: 2026-10-01T13:05:00Z
 # Purpose: Contract tests for the Hermes memory plugin; v1.2.0 retargets the
 #          astral_store tests to /v1/memory/add and pins STORE-1 (explicit
 #          stores must reach the server verbatim, never via the extractor).
 #
 # tests/test_provider_contract.py
+# v1.5.0 — F1 prefetch instrumentation tests (plugin v2.11.3,
+#          TASK_MEMORY_HERMES_F1_INSTRUMENTATION_20261001 §5): compute
+#          qhash = sha256(raw query)[:12], cache_hit flag, the stale
+#          flag (H1-vs-H2 discriminator, no cross-turn join), never-
+#          raises on malformed server responses, dup_in_turn counter,
+#          warm-line source/call_site literals, query_used truncation
+#          (§4: 80 chars, newline-stripped), and the 2.11.3 status line.
 # v1.4.0 — RT-13 P0 (plugin v2.11.1): fidelity hook regression pin —
 #          the 2.10.0 capture guard (D) must gate INGEST, never the
 #          observation hooks — plus the INFO instrumentation contract
@@ -54,11 +61,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import inspect
 import json
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -1424,3 +1433,204 @@ def test_status_line_falls_back_to_legacy_health_keys(
     assert "embedding=fake" in lines[0]
     assert "rerank=off" in lines[0]
     assert "hyde=off" in lines[0]
+
+
+# ---------------------------------------------------------------------------
+# 13. Prefetch instrumentation (plugin v2.11.3, F1 — logging only)
+#
+#   TASK_MEMORY_HERMES_F1_INSTRUMENTATION_20261001 §2/§5. One INFO line per
+#   prefetch compute / serve / warm, prefix "astral_prefetch:", key=value,
+#   single line, greppable. qhash = sha256(raw query)[:12], joinable with
+#   the server E9 ledger. `stale` is the H1-vs-H2 discriminator — it must
+#   be computable without a cross-turn log join. Logging never raises.
+# ---------------------------------------------------------------------------
+
+
+def _serve_augmented(http, monkeypatch, response):
+    """Route /v1/memory/augmented-prompt to a canned response.
+
+    Same single-append discipline as _serve_search (see its comment): only
+    the handled path appends to http.calls, everything else delegates to
+    _FakeHttp.post exactly once.
+    """
+    def _post(path, payload=None, timeout=0):
+        if path == "/v1/memory/augmented-prompt":
+            http.calls.append(("POST", path, payload))
+            return json.loads(json.dumps(response))
+        return _FakeHttp.post(http, path, payload, timeout)
+    monkeypatch.setattr(http, "post", _post)
+
+
+def _prefetch_info(caplog):
+    return [r.getMessage() for r in caplog.records
+            if r.levelno == logging.INFO
+            and r.getMessage().startswith("astral_prefetch: ")]
+
+
+def test_prefetch_compute_logs_qhash(provider, http, monkeypatch, caplog):
+    """§5.1: _do_prefetch emits one event=compute line whose 12-hex qhash
+    equals sha256 of the raw query string it sent to the server."""
+    _serve_augmented(http, monkeypatch, {
+        "context_block": '<memory id="m-1" relevance="0.83">rate limit</memory>',
+        "memory_ids": ["m-1"],
+    })
+    with caplog.at_level(logging.INFO, logger="astral-memory"):
+        provider.prefetch("what is the API rate limit?",
+                          session_id="session-alpha")
+
+    computes = [l for l in _prefetch_info(caplog) if "event=compute" in l]
+    assert len(computes) == 1, _prefetch_info(caplog)
+
+    sent = http.payload_for("/v1/memory/augmented-prompt")
+    expected = hashlib.sha256(
+        sent["query"].encode("utf-8")).hexdigest()[:12]
+    m = re.search(r"\bqhash=([0-9a-f]+)\b", computes[0])
+    assert m is not None, computes[0]
+    assert m.group(1) == expected
+    assert len(m.group(1)) == 12
+    assert f'sid=session-alpha' in computes[0]
+    assert "qlen=" in computes[0]
+    assert "top_relevance=0.83" in computes[0]
+    assert "memory_ids=m-1" in computes[0]
+    assert "n=1" in computes[0]
+    assert "elapsed_ms=" in computes[0]
+    # §4: query_used is quoted, newline-stripped, and present — but never
+    # longer than 80 chars even when the query is.
+    q = re.search(r'query_used="([^"]*)"', computes[0])
+    assert q is not None, computes[0]
+    assert len(q.group(1)) <= 80
+
+
+def test_prefetch_compute_query_used_truncated_and_stripped(
+        provider, http, monkeypatch, caplog):
+    """§4 guardrail: query_used is truncated to 80 chars and
+    newline-stripped — the query may contain Signal message text."""
+    _serve_augmented(http, monkeypatch, {"context_block": ""})
+    long_query = ("line one of a very long message\n" * 10) + "tail"
+    with caplog.at_level(logging.INFO, logger="astral-memory"):
+        provider.prefetch(long_query, session_id="session-alpha")
+
+    computes = [l for l in _prefetch_info(caplog) if "event=compute" in l]
+    assert len(computes) == 1
+    q = re.search(r'query_used="([^"]*)"', computes[0])
+    assert q is not None
+    assert "\n" not in q.group(1)
+    assert len(q.group(1)) <= 80
+
+
+def test_prefetch_serve_cache_hit_flag(provider, http, monkeypatch, caplog):
+    """§5.2: warm then pop → cache_hit=true and no server round trip; pop
+    with an empty cache → cache_hit=false and a fallback compute."""
+    _serve_augmented(http, monkeypatch, {"context_block": "CONTEXT<A>"})
+    with caplog.at_level(logging.INFO, logger="astral-memory"):
+        provider.queue_prefetch("warm me", session_id="session-alpha")
+        provider.prefetch("ignored by the hit path",
+                          session_id="session-alpha")
+        provider.prefetch("cold miss", session_id="session-alpha")
+
+    serves = [l for l in _prefetch_info(caplog) if "event=serve" in l]
+    assert len(serves) == 2, _prefetch_info(caplog)
+    assert "cache_hit=true" in serves[0]
+    assert "cache_hit=false" in serves[1]
+    # Every serve line carries the block fingerprint and size.
+    for s in serves:
+        assert re.search(r"\bblock_hash=([0-9a-f]{12})\b", s), s
+        assert "n=" in s
+        assert "served_for_turn_qhash=" in s
+        assert "stale=" in s
+
+
+def test_prefetch_serve_stale_flag(provider, http, monkeypatch, caplog):
+    """§5.3: warm with text A, serve for turn text B → stale=true; the
+    same text → stale=false. This is the one bit that separates H1 from
+    H2 without cross-turn log joins."""
+    _serve_augmented(http, monkeypatch, {"context_block": "CONTEXT<A>"})
+    with caplog.at_level(logging.INFO, logger="astral-memory"):
+        # Warm on A; the next turn's user text is B — the off-by-one shape.
+        provider.queue_prefetch("question about pineapple pizza",
+                                session_id="session-alpha")
+        provider.prefetch("question about the deployment window",
+                          session_id="session-alpha")
+
+        # Warm and serve the same text — the fresh shape.
+        provider.queue_prefetch("question about the deployment window",
+                                session_id="session-alpha")
+        provider.prefetch("question about the deployment window",
+                          session_id="session-alpha")
+
+    serves = [l for l in _prefetch_info(caplog) if "event=serve" in l]
+    assert len(serves) == 2, _prefetch_info(caplog)
+    assert "stale=true" in serves[0]
+    assert "stale=false" in serves[1]
+    # qhash is the hash of the query the block was computed against;
+    # served_for_turn_qhash is the hash of the turn's user text.
+    a = re.search(r"\bqhash=([0-9a-f]{12})\b", serves[0])
+    b = re.search(r"served_for_turn_qhash=([0-9a-f]{12}|none)\b", serves[0])
+    assert a and b and a.group(1) != b.group(1)
+
+
+def test_prefetch_logging_never_raises(provider, http, monkeypatch, caplog):
+    """§5.4: malformed server response (no <memory> tags, no memory_ids)
+    → serve/compute lines still emitted with top_relevance=none. The
+    default _FakeHttp canned response is exactly this shape."""
+    with caplog.at_level(logging.INFO, logger="astral-memory"):
+        provider.queue_prefetch("warm me", session_id="session-alpha")
+        provider.prefetch("serve me", session_id="session-alpha")
+
+    infos = _prefetch_info(caplog)
+    computes = [l for l in infos if "event=compute" in l]
+    serves = [l for l in infos if "event=serve" in l]
+    assert len(computes) == 1, infos
+    assert len(serves) == 1, infos
+    assert "top_relevance=none" in computes[0]
+    assert "memory_ids=" in computes[0]
+    assert "parse_error=" not in computes[0]
+    assert "parse_error=" not in serves[0]
+
+
+def test_dup_in_turn_counter(provider, http, monkeypatch, caplog):
+    """§5.5: two _do_prefetch calls within one turn → the second line
+    carries dup_in_turn=2, the first carries none."""
+    _serve_augmented(http, monkeypatch, {"context_block": "CONTEXT<q>"})
+    with caplog.at_level(logging.INFO, logger="astral-memory"):
+        # Two computes in the same turn: two queue_prefetch calls (each
+        # runs _do_prefetch inline; the second overwrites the cache slot).
+        provider.queue_prefetch("same turn question", session_id="session-alpha")
+        provider.queue_prefetch("same turn question", session_id="session-alpha")
+
+    computes = [l for l in _prefetch_info(caplog) if "event=compute" in l]
+    assert len(computes) == 2, _prefetch_info(caplog)
+    # First compute in the turn: no dup_in_turn field.
+    assert "dup_in_turn" not in computes[0]
+    # Second compute in the same turn: dup_in_turn=2.
+    assert "dup_in_turn=2" in computes[1]
+
+
+def test_warm_logs_source_and_call_site(provider, http, caplog):
+    """§2.3: the warm line carries qhash plus the source and call_site
+    literals set at the call site (never inferred)."""
+    with caplog.at_level(logging.INFO, logger="astral-memory"):
+        provider.queue_prefetch("warm query", session_id="session-alpha")
+
+    warms = [l for l in _prefetch_info(caplog) if "event=warm" in l]
+    assert len(warms) == 1
+    expected = hashlib.sha256(b"warm query").hexdigest()[:12]
+    assert f"qhash={expected}" in warms[0]
+    assert "source=user_text" in warms[0]
+    assert "call_site=run_agent:_sync_external_memory_for_turn" in warms[0]
+    assert "sid=session-alpha" in warms[0]
+
+
+def test_status_line_prints_2_11_3(monkeypatch, tmp_path, http, caplog):
+    """§4: status line must print 2.11.3 (the manifest bumped in step)."""
+    monkeypatch.setattr(astral_memory, "_HttpClient",
+                        lambda url, *a, **kw: http)
+    p = AstralCoreMemoryProvider()
+    with caplog.at_level(logging.INFO, logger="astral-memory"):
+        p.initialize("s", hermes_home=str(tmp_path))
+    p.shutdown()
+
+    lines = [r.getMessage() for r in caplog.records
+             if "Astral Core Memory v" in r.getMessage()]
+    assert len(lines) == 1
+    assert "v2.11.3" in lines[0]

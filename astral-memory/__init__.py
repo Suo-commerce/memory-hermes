@@ -1,10 +1,109 @@
-# Generation Timestamp: 2026-09-22T00:00:00Z
+# Generation Timestamp: 2026-10-13T20:00:00Z
 # Hermes MemoryProvider plugin — register_memory_provider entry point
-# Purpose: Hermes memory plugin — v2.9.1 routes astral_store to the direct
-#          /v1/memory/add endpoint so explicit stores land verbatim (no
-#          dyad extraction, no surprise gate, category + namespace as real
-#          fields); v2.9.0 added RT-13 Layer A response-fidelity feedback
-#          (SPEC-REMEMBERING-TOUCH-001 Amendment A5 §2).
+# Purpose: Hermes memory plugin — v2.12.0 fixes the one-turn-behind prefetch
+#          (live-turn re-query), adds the relevance inject floor on the
+#          augmented-prompt block (reads server F11 / 2.16.1 relevance),
+#          the T0 vacuity pre-filter on auto-capture, and astral_forget by
+#          memory id / candidate lookup. v2.9.1 routed astral_store to the
+#          direct /v1/memory/add endpoint; v2.9.0 added RT-13 Layer A
+#          response-fidelity feedback (SPEC-REMEMBERING-TOUCH-001 A5 §2).
+#
+# v2.12.0 CHANGES (TASK_MEMORY_HERMES_2_12_0_20261013 — behaviour release):
+#   FIX  — P1 prefetch one-turn-behind (F1 finding 2026-10-01: every serve
+#          was `cache_hit=true stale=true`). The warm chain hands
+#          queue_prefetch the COMPLETED user turn, so the cached block was
+#          computed for message N-1 and injected into message N; the RT-10
+#          window's injected labels belonged to the previous question.
+#          New config `prefetch_mode` (default "live"): prefetch() serves
+#          the cache ONLY when the cached block's qhash equals the live
+#          query's qhash (the 2.11.3 `_prefetch_block_meta` memo is the
+#          discriminator); otherwise the stale block is discarded and the
+#          live query is computed synchronously. queue_prefetch() makes NO
+#          network call in live mode (the warm result could only ever be
+#          served when the user repeats themselves verbatim) — this also
+#          removes the duplicate augmented-prompt retrieval per message
+#          that fed α / stability buffers twice. `prefetch_mode: "warm"`
+#          restores the 2.11.3 behaviour byte-for-byte (kill switch).
+#          F1 instrumentation kept: serve line gains `mode=` and
+#          `discarded=` (the stale block dropped) fields.
+#   NEW  — Inject floor (`inject_floor`, float, default 0.0 = off). After
+#          the augmented-prompt response arrives, <memory …> elements in
+#          context_block whose relevance="…" is below the floor are removed
+#          from the injected block, and their ids are removed from
+#          _recalled_ids / _served_texts so fidelity never credits a memory
+#          the LLM did not see. When every element is below the floor the
+#          memory block is empty (preferences still inject). Elements with
+#          no parseable relevance are KEPT (unknown ≠ low). The server's
+#          preamble/legend lines outside <memory> elements are left as-is.
+#          If the block carries no <memory> elements at all (older server
+#          or different render) the floor is a no-op and the compute line
+#          says `floor=unparsed`. One INFO line per applied floor:
+#          "astral_inject_floor: sid=… floor=… kept=… dropped=… ids=…".
+#          Ships OFF — observe `top_relevance` in the compute lines first,
+#          then set the floor (§5 observe → validate → activate).
+#   NEW  — T0 vacuity pre-filter (`t0_vacuity_filter`, default true).
+#          sync_turn skips INGEST of a turn when the user message carries
+#          zero content tokens (fidelity.content_tokens: ≥4 chars, not a
+#          stopword) AND the assistant reply carries fewer than three —
+#          "thanks" / "you're welcome", "ok" / "👍", a bare "/" command
+#          with a one-liner. This is NOT the v2.3.0 word-count filter that
+#          N-10a removed: "Mina the Hollower" has three content tokens and
+#          passes; any proper noun passes; a short user turn with a real
+#          assistant answer passes (the dyad extractor needs the answer).
+#          Fidelity still observes the turn (it runs before every gate).
+#          Counter `_capture_skipped_vacuous` surfaced in astral_sync next
+#          to `capture_skipped_distilled`. INFO line per skip.
+#   NEW  — astral_forget gains `memory_id` (DELETE /v1/memory/{id}, the
+#          per-memory route live since server v2.8.0) and `query` (POST
+#          /v1/memory/search with no_side_effects:true, limit 5 — returns
+#          candidate ids + text excerpts and NEVER deletes; the agent must
+#          call again with memory_id after the user confirms). `source`
+#          (delete-all-from-source) unchanged. Exactly one of the three
+#          must be given; memory_id wins if several are. Deleted ids are
+#          dropped from _recalled_ids / _served_texts for the session.
+#   FIX  — Automatic distillation modes (on_session_start / on_turn_start)
+#          were dead since astral_distillation.py v2.0.0: initialize()
+#          constructed `_distill.AstralClient` (renamed DigestClient in
+#          v2.0.0) and _run_distillation read `res.selected` /
+#          `res.fetched` (RenderResult has `files` / `diffs`). The
+#          AttributeError was caught and logged as "distillation disabled"
+#          — the default `manual` mode hid it. Both call sites now match
+#          the v2.0.0 module. Manual mode unaffected.
+#   FIX  — RT-13 served set is now TURN-scoped. `_served_texts[sid]` was a
+#          session-lifetime bucket (last 64 ids) and _fidelity_after_turn
+#          merged every id in it into the turn's `served` list — harmless
+#          while only astral_recall filled it, but with server F11 (per-
+#          memory text on the augmented-prompt response) A1 would have
+#          scored each reply against memories injected on EARLIER turns,
+#          inflating hits before the ≥80% hand check. Now: a prefetch
+#          compute resets the bucket, astral_recall adds to it, and
+#          _fidelity_after_turn consumes + clears it.
+#   NEW  — config schema entries + save_config coercion for prefetch_mode,
+#          inject_floor, t0_vacuity_filter.
+#   FIX  — version 2.11.3 -> 2.12.0 (schemas.py + plugin.yaml in step).
+#
+# v2.11.3 CHANGES (F1 instrumentation — logging only, zero behaviour change):
+#   NEW  — "astral_prefetch:" INFO lines make the prefetch off-by-one visible
+#          per turn (Hermes reports byte-identical <memory> blocks across
+#          topic-shifted turns; H1 = cache serve lags one turn, H2 = warm
+#          call site passes the COMPLETED user turn — run_agent.py
+#          _sync_external_memory_for_turn). Three events: event=warm
+#          (queue_prefetch: qhash, source=literal, call_site=literal),
+#          event=compute (_do_prefetch: qhash, qlen, query_used truncated to
+#          80 chars newline-stripped, memory_ids, n, top_relevance parsed
+#          from relevance="…" in the <memory …> tags of context_block — none
+#          if unparseable, elapsed_ms, dup_in_turn when > 1 compute fires in
+#          one turn), event=serve (prefetch: cache_hit, qhash of the block
+#          served, served_for_turn_qhash from the current query, stale=
+#          cache_hit and hashes differ, block_hash of the injected block,
+#          n). qhash/block_hash = sha256()[:12] on the RAW query string the
+#          plugin sends (joinable with the server E9 ledger's query_hash).
+#          Logging never raises — every parse wrapped, failures logged as
+#          parse_error=<type> and skipped.
+#   KEEP — no new network calls, no change to _prefetch_cache semantics, no
+#          change to which block is injected, no change to any response
+#          handling. The behaviour fix (re-query on the live turn) is 2.12.0.
+#   FIX  — version 2.11.2 -> 2.11.3 (schemas.py + plugin.yaml in step).
 #
 # v2.11.1 CHANGES (RT-13 P0 — fidelity hook silent since 2.10.0):
 #   FIX  — sync_turn(): the v2.10.0 capture guard (D) sat ABOVE the RT-13
@@ -427,7 +526,7 @@
 #   REMOVED — nothing. tools.py deletion is a separate change.
 """
 Astral Core Memory — Hermes Agent Memory Provider Plugin
-Version: 2.11.2
+Version: 2.12.0
 
 Offline-first persistent memory with surprise-gated learning.
 Implements the MemoryProvider ABC for proper Hermes integration.
@@ -463,13 +562,15 @@ License: MIT
 
 from __future__ import annotations
 
+import contextvars
+import hashlib
 import inspect
 import json
 import logging
 import os
+import re
 import threading
 import time
-import contextvars
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -496,7 +597,7 @@ logger = logging.getLogger("astral-memory")
 # Constants
 # ---------------------------------------------------------------------------
 
-_VERSION = "2.11.2"
+_VERSION = "2.12.0"
 
 # --- DL-1 loop guard (SPEC astral-core-distillation-spec v1.1 §4.6) --------
 # The distillation pass derives MEMORY.md/USER.md FROM Astral Core; if
@@ -520,11 +621,157 @@ _DISTILL_MARKER_PREFIX = "[astral-distillation v"  # layer 2 literal
 _DISTILL_CAPTURE_SKIP = _DISTILL_MARKER_PREFIX
 
 
+# --- v2.11.3 (F1): prefetch instrumentation helpers — pure, never raise ----
+# qhash must be joinable with the server E9 ledger's query_hash: both hash
+# the RAW query string the plugin sends (pre-HyDE, pre-namespace label).
+
+def _qhash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+
+# <memory id="…" relevance="0.83" …> — server >= 2.16.1 embeds relevance in
+# the <memory> tags of context_block; no per-memory array exists until
+# server F11, so this is the only place it is visible to the plugin.
+_RELEVANCE_RE = re.compile(r'relevance="([^"]*)"')
+
+
+def _top_relevance(context_block: str) -> str:
+    """Max relevance="…" across <memory …> tags, or 'none'. Never raises."""
+    try:
+        best: float | None = None
+        for m in _RELEVANCE_RE.finditer(context_block or ""):
+            try:
+                v = float(m.group(1))
+            except ValueError:
+                continue
+            if best is None or v > best:
+                best = v
+        return f"{best:g}" if best is not None else "none"
+    except Exception:
+        return "none"
+
+
+def _log_prefetch(line: str, *args: Any) -> None:
+    """Single INFO line, key=value, greppable; logging must never raise."""
+    try:
+        logger.info(line, *args)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _is_distilled_write(content: str) -> bool:
     """True when the write originates from the distillation pass (DL-1)."""
     if _distill_in_progress():
         return True
     return _DISTILL_MARKER_PREFIX in (content or "")
+
+
+# --- v2.12.0: T0 vacuity pre-filter ----------------------------------------
+# Same token rule as fidelity.content_tokens (≥4 chars, not a stopword)
+# with a stoplist extended by the acknowledgement vocabulary ("thanks",
+# "welcome", "okay", "kiitos", …). A proper noun always counts, so this can
+# never reproduce the N-10a regression.
+_VACUITY_MIN_TOKEN_LEN = 4
+_VACUITY_WORD_RE = re.compile(r"[a-zA-ZäöåÄÖÅ0-9_\-\./:]+")
+_VACUITY_STOP = {
+    "that", "this", "with", "from", "have", "were", "been", "they", "them",
+    "their", "there", "then", "than", "what", "when", "where", "which",
+    "would", "could", "should", "about", "into", "just", "like", "also",
+    "your", "will", "some", "more", "most", "very", "much", "does", "done",
+    "make", "made", "here", "over", "only", "such", "each", "other", "these",
+    "those", "because", "being", "after", "before", "again", "still",
+    "really", "thing", "things", "something", "anything", "using", "used",
+    "thanks", "thank", "okay", "sure", "great", "nice", "cool", "yeah",
+    "welcome", "please", "right", "good", "perfect",
+    "että", "mutta", "kanssa", "kuin", "sitten", "tämä", "nämä", "ovat",
+    "olen", "olet", "ollut", "vain", "myös", "koska", "jotta", "mikä",
+    "mitä", "missä", "miten", "joka", "jotka", "sillä", "niin", "kyllä",
+    "kiitos", "selvä", "okei", "hyvä", "hienoa",
+}
+
+
+def _content_token_count(text: str) -> int:
+    """Number of content tokens in text. Never raises.
+
+    Uses the local stoplist rather than fidelity.content_tokens on purpose:
+    the fidelity list is tuned for evidence overlap and keeps "thanks" /
+    "welcome" / "okay" as content, which is exactly what vacuity must not.
+    """
+    try:
+        toks = set()
+        for w in _VACUITY_WORD_RE.findall(text or ""):
+            w = w.lower().strip(".,:;/-")
+            if len(w) >= _VACUITY_MIN_TOKEN_LEN and w not in _VACUITY_STOP:
+                toks.add(w)
+        return len(toks)
+    except Exception:  # noqa: BLE001
+        return 1  # unknown → treat as content, never skip on a parse error
+
+
+def _is_vacuous_turn(user_content: str, assistant_content: str) -> bool:
+    """True only for content-free exchanges: zero user content tokens AND
+    fewer than three assistant content tokens. Deliberately strict — the
+    cost of a false positive (a lost memory) is higher than the cost of a
+    false negative (the server's surprise gate drops the noise anyway)."""
+    try:
+        return (_content_token_count(user_content) == 0
+                and _content_token_count(assistant_content) < 3)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# --- v2.12.0: inject floor --------------------------------------------------
+# Server >= 2.16.1 renders each injected memory as
+#   <memory id="…" relevance="0.83" …>text</memory>
+# inside context_block. The floor removes whole elements below the
+# threshold and reports which ids went. Anything outside <memory> elements
+# (server preamble, hedge instruction, legend) is untouched.
+_MEMORY_ELEM_RE = re.compile(r"<memory\b([^>]*)>.*?</memory>\s*", re.S)
+_ATTR_ID_RE = re.compile(r'\bid="([^"]*)"')
+
+
+def _apply_inject_floor(block: str, floor: float) -> tuple[str, list[str], list[str], bool]:
+    """Return (filtered_block, kept_ids, dropped_ids, parsed).
+
+    parsed=False means the block carried no <memory> elements, so the
+    floor was a no-op. Elements whose relevance is missing/unparseable are
+    kept (unknown is not low). Never raises — on any error the original
+    block is returned unchanged with parsed=False.
+    """
+    try:
+        if not block or floor <= 0.0:
+            return block, [], [], False
+        kept: list[str] = []
+        dropped: list[str] = []
+        seen = False
+
+        def _decide(m: re.Match) -> str:
+            nonlocal seen
+            seen = True
+            attrs = m.group(1) or ""
+            idm = _ATTR_ID_RE.search(attrs)
+            mid = idm.group(1) if idm else ""
+            rm = _RELEVANCE_RE.search(attrs)
+            rel: float | None = None
+            if rm:
+                try:
+                    rel = float(rm.group(1))
+                except ValueError:
+                    rel = None
+            if rel is not None and rel < floor:
+                if mid:
+                    dropped.append(mid)
+                return ""
+            if mid:
+                kept.append(mid)
+            return m.group(0)
+
+        out = _MEMORY_ELEM_RE.sub(_decide, block)
+        if not seen:
+            return block, [], [], False
+        return out, kept, dropped, True
+    except Exception:  # noqa: BLE001
+        return block, [], [], False
 # ---------------------------------------------------------------------------
 _DEFAULT_SERVER_URL = "http://127.0.0.1:8090"
 
@@ -868,6 +1115,18 @@ class AstralCoreMemoryProvider(MemoryProvider):
         # Turn counters, keyed by session_id.
         self._turn_counts: dict[str, int] = {}
 
+        # v2.11.3 (F1): {sid: {"qhash": str, "n": int}} — what the served
+        # block was computed against (raw query hash + memory count),
+        # recorded on every successful compute so the serve line can
+        # compute `stale` without a cross-turn log join. Lifecycle mirrors
+        # _prefetch_cache (cleared on reset, popped across id boundaries).
+        self._prefetch_block_meta: dict[str, dict[str, Any]] = {}
+
+        # v2.11.3 (F1): {sid: {"turn": int, "count": int}} — number of
+        # _do_prefetch invocations within one turn, for the dup_in_turn
+        # field on the event=compute line. Logging only.
+        self._prefetch_compute_counts: dict[str, dict[str, int]] = {}
+
         # Memory IDs injected into context this session, keyed by
         # session_id. Populated from `memory_ids` in the augmented-prompt
         # response (server >= v2.12.x); empty on older servers. Used as
@@ -917,6 +1176,11 @@ class AstralCoreMemoryProvider(MemoryProvider):
         self._digest_note_pending: int = 0          # rendered-once note count
         self._capture_skipped_distilled: int = 0    # D-AC3 counter
         self._digest_pending_ids: list = []          # C: ordered cache for list-number resolution
+        # v2.12.0
+        self._prefetch_mode: str = "live"           # live | warm
+        self._inject_floor: float = 0.0             # 0.0 = off
+        self._t0_vacuity_filter: bool = True
+        self._capture_skipped_vacuous: int = 0      # T0 vacuity counter
 
     # ------------------------------------------------------------------
     # Identity & availability
@@ -943,6 +1207,8 @@ class AstralCoreMemoryProvider(MemoryProvider):
         with self._state_lock:
             self._active_session_id = session_id
             self._prefetch_cache.clear()
+            self._prefetch_block_meta.clear()
+            self._prefetch_compute_counts.clear()
             self._turn_counts.clear()
             self._recalled_ids.clear()
             # §9.2: reset active namespace to config default on session start.
@@ -1019,8 +1285,13 @@ class AstralCoreMemoryProvider(MemoryProvider):
         self._distill_engine = None
         if _distill is not None and self._distill_mode != "manual":
             try:
+                # v2.12.0: astral_distillation v2.0.0 renamed AstralClient
+                # → DigestClient; the old name raised AttributeError here and
+                # was swallowed as "distillation disabled".
+                client_cls = getattr(_distill, "DigestClient", None) \
+                    or _distill.AstralClient
                 self._distill_engine = _distill.DistillationEngine(
-                    _distill.AstralClient(
+                    client_cls(
                         base_url=self._server_url,
                         api_token=self._api_token,
                         hermes_home=Path(self._hermes_home),
@@ -1050,9 +1321,11 @@ class AstralCoreMemoryProvider(MemoryProvider):
         try:
             res = eng.run()
             if res.wrote:
+                # v2.12.0: RenderResult (v2.0.0) carries files/diffs/
+                # generation — the v1.x selected/fetched fields are gone.
                 logger.info(
-                    "astral-memory: distilled %d/%d memories -> %s",
-                    res.selected, res.fetched,
+                    "astral-memory: distilled digest gen=%s -> %s",
+                    getattr(res, "generation", "?"),
                     ", ".join(Path(p).name for p in res.files))
             elif res.warning and res.warning != "cache_fresh_skip":
                 logger.debug("astral-memory: distillation skipped: %s",
@@ -1121,6 +1394,32 @@ class AstralCoreMemoryProvider(MemoryProvider):
         # v2.10.0 (C.2): digest pending-approval note.
         self._digest_notify = bool(cfg.get("digest_notify", True))
         self._digest_notify_ttl = int(cfg.get("digest_notify_ttl", 21600))
+
+        # v2.12.0: prefetch mode. "live" re-queries on the live turn (the
+        # fix); "warm" is the 2.11.3 one-turn-behind cache (kill switch).
+        pmode = str(cfg.get("prefetch_mode", self._prefetch_mode) or "live").strip().lower()
+        if pmode not in ("live", "warm"):
+            logger.warning("Invalid prefetch_mode '%s' — falling back to live", pmode)
+            pmode = "live"
+        self._prefetch_mode = pmode
+
+        # v2.12.0: inject floor on augmented-prompt relevance. 0 = off.
+        try:
+            floor = float(cfg.get("inject_floor", self._inject_floor) or 0.0)
+        except (TypeError, ValueError):
+            floor = 0.0
+        if not (0.0 <= floor <= 1.0):
+            logger.warning("inject_floor %s out of [0,1] — disabled", floor)
+            floor = 0.0
+        self._inject_floor = floor
+
+        # v2.12.0: T0 vacuity pre-filter on auto-capture.
+        self._t0_vacuity_filter = bool(cfg.get("t0_vacuity_filter", self._t0_vacuity_filter))
+        logger.info(
+            "astral-memory: prefetch_mode=%s inject_floor=%s t0_vacuity_filter=%s",
+            self._prefetch_mode, self._inject_floor if self._inject_floor else "off",
+            "on" if self._t0_vacuity_filter else "off",
+        )
 
         scope = str(cfg.get("session_scope", "") or "").strip().lower()
         self._session_scope = scope if scope == "verification" else None
@@ -1257,6 +1556,10 @@ class AstralCoreMemoryProvider(MemoryProvider):
                     "served": served_ids,
                     "prev_user": (user_content or "")[:2000],
                 }
+                # v2.12.0: the turn's served set is consumed here. The next
+                # prefetch compute starts a fresh one; in warm mode the
+                # warm compute for N+1 lands after this and does the same.
+                self._served_texts[sid] = {}
             n_signals = 0
             if served_ids:
                 served = [_fidelity.ServedMemory(i, texts.get(i, ""))
@@ -1499,13 +1802,75 @@ class AstralCoreMemoryProvider(MemoryProvider):
         }, indent=2, default=str)
 
     def _tool_forget(self, args: dict, session_id: str) -> str:
-        source = args.get("source", "")
-        if not source:
-            return json.dumps({"error": "source is required"})
-        return json.dumps(
-            self._http.delete(f"/v1/memory/source/{source}"),
-            indent=2, default=str,
-        )
+        """Forget by memory_id (delete one), by source (delete all from a
+        source), or look up candidates by query (never deletes).
+
+        v2.12.0: `memory_id` → DELETE /v1/memory/{id} (per-memory route,
+        server >= v2.8.0). `query` → POST /v1/memory/search with
+        no_side_effects:true; returns up to 5 candidates with ids and text
+        excerpts so the user can pick — the agent must call again with
+        memory_id. A query never deletes anything. Precedence when several
+        are given: memory_id > source > query.
+        """
+        memory_id = str(args.get("memory_id") or "").strip()
+        source = str(args.get("source") or "").strip()
+        query = str(args.get("query") or "").strip()
+
+        if memory_id:
+            if "/" in memory_id or ".." in memory_id or len(memory_id) > 128:
+                return json.dumps({"error": "memory_id is malformed"})
+            result = self._http.delete(f"/v1/memory/{memory_id}")
+            if isinstance(result, dict) and "error" not in result:
+                # Keep fidelity / manifest state honest for this session.
+                with self._state_lock:
+                    ids = self._recalled_ids.get(session_id)
+                    if ids:
+                        self._recalled_ids[session_id] = [
+                            i for i in ids if i != memory_id]
+                    texts = self._served_texts.get(session_id)
+                    if texts:
+                        texts.pop(memory_id, None)
+                result = {"forgotten": True, "memory_id": memory_id, **result}
+            return json.dumps(result, indent=2, default=str)
+
+        if source:
+            return json.dumps(
+                self._http.delete(f"/v1/memory/source/{source}"),
+                indent=2, default=str,
+            )
+
+        if query:
+            payload: dict[str, Any] = {
+                "query": query, "limit": 5, "no_side_effects": True,
+            }
+            ns = self._resolve_namespace()
+            if ns:
+                payload["namespace_filter"] = ns
+            data = self._http.post("/v1/memory/search", payload)
+            if not isinstance(data, dict) or "error" in data:
+                return json.dumps(data, indent=2, default=str)
+            cands = []
+            for r in data.get("results") or []:
+                if not isinstance(r, dict):
+                    continue
+                mid = r.get("id") or r.get("memory_id")
+                if not mid:
+                    continue
+                cands.append({
+                    "memory_id": str(mid),
+                    "text": str(r.get("text") or r.get("content") or "")[:200],
+                    "score": r.get("score", r.get("relevance")),
+                    "provenance": _provenance_tag(r) or None,
+                })
+            return json.dumps({
+                "deleted": False,
+                "candidates": cands,
+                "next": ("Confirm with the user which one to forget, then call "
+                         "astral_forget with that memory_id. Nothing has been "
+                         "deleted."),
+            }, indent=2, default=str, ensure_ascii=False)
+
+        return json.dumps({"error": "one of memory_id, source or query is required"})
 
     def _tool_briefing(self, args: dict, session_id: str) -> str:
         return json.dumps(
@@ -1543,6 +1908,10 @@ class AstralCoreMemoryProvider(MemoryProvider):
             # v2.10.0 (D-AC3): capture-guard counter visible in status.
             result["capture_skipped_distilled"] = \
                 self._capture_skipped_distilled
+            # v2.12.0: T0 vacuity counter beside it.
+            result["capture_skipped_vacuous"] = self._capture_skipped_vacuous
+            result["prefetch_mode"] = self._prefetch_mode
+            result["inject_floor"] = self._inject_floor
         return json.dumps(result, indent=2, default=str)
 
     def _tool_namespace(self, args: dict, session_id: str) -> str:
@@ -1875,30 +2244,133 @@ class AstralCoreMemoryProvider(MemoryProvider):
 
         with self._state_lock:
             cached = self._prefetch_cache.pop(sid, None)
+            meta = dict(self._prefetch_block_meta.get(sid) or {})
+
+        # v2.12.0 (P1 fix): in live mode a cached block is served ONLY when
+        # it was computed for this exact query. The warm chain passes the
+        # COMPLETED user turn, so under 2.11.3 every cache hit was one turn
+        # behind (F1: cache_hit=true stale=true on every serve). A block
+        # whose qhash differs from the live query is discarded and the live
+        # query is computed now — recall belongs to the message being
+        # answered. "warm" mode keeps the 2.11.3 pop-and-serve verbatim.
+        if cached and self._prefetch_mode == "live":
+            live_q = _qhash(query) if query.strip() else "none"
+            if meta.get("qhash") != live_q:
+                _log_prefetch(
+                    "astral_prefetch: event=discard sid=%s mode=live "
+                    "cached_qhash=%s live_qhash=%s",
+                    sid, meta.get("qhash") or "none", live_q,
+                )
+                cached = None
+
         if cached:
+            self._log_prefetch_serve(sid, cached, query, cache_hit=True)
             return cached
 
-        # Synchronous fallback — first turn of a session, or the background
-        # warm hasn't landed yet.
-        return self._do_prefetch(query, sid)
+        # Synchronous compute — live mode always lands here unless the
+        # user repeated themselves verbatim; warm mode lands here on the
+        # first turn of a session or when the warm hasn't finished.
+        result = self._do_prefetch(query, sid)
+        if result:
+            self._log_prefetch_serve(sid, result, query, cache_hit=False)
+        return result
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """Warm the cache for the next turn. Non-blocking.
 
         MemoryManager already dispatches this on a background worker, so we
         do the work inline rather than spawning a second thread.
+
+        v2.11.3 (F1): `source` / `call_site` on the warm line are literals,
+        not inferred. The deployed warm chain is run_agent
+        _sync_external_memory_for_turn → MemoryManager.queue_prefetch_all →
+        here, passing the COMPLETED user turn (H2 — the task doc's
+        "run_agent:948" line number is stale; the function name is the
+        stable identifier).
+
+        v2.12.0: in live mode this makes NO network call. The warm result
+        was computed for the completed turn and could only be served if the
+        next message hashed identically; meanwhile it cost one extra
+        augmented-prompt retrieval per message — with record_hits — which
+        drove α, idle resets and stability buffers for memories the LLM
+        never saw (the 2.16.1 day-0 "four identical searches" finding).
+        The warm line is still logged so the call chain stays observable.
         """
         if not self._auto_recall or not self._ready():
             return
         sid = self._sid(session_id)
+        try:
+            _log_prefetch(
+                "astral_prefetch: event=warm sid=%s qhash=%s source=%s "
+                "call_site=%s mode=%s",
+                sid, _qhash(query), "user_text",
+                "run_agent:_sync_external_memory_for_turn",
+                self._prefetch_mode,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        if self._prefetch_mode == "live":
+            return
         result = self._do_prefetch(query, sid)
         if result:
             with self._state_lock:
                 self._prefetch_cache[sid] = result
 
+    def _log_prefetch_serve(self, sid: str, block: str, current_query: str,
+                            *, cache_hit: bool) -> None:
+        """v2.11.3 (F1): one event=serve INFO line per served block.
+
+        `stale` is the H1-vs-H2 discriminator: cache_hit=true with
+        served_for_turn_qhash != qhash means the block was computed against
+        a previous turn's query and handed to this turn anyway. qhash/n
+        come from the compute-time memo (_prefetch_block_meta); unknown →
+        none / stale=unknown. Logging only — never changes what is served.
+        """
+        try:
+            with self._state_lock:
+                meta = self._prefetch_block_meta.get(sid) or {}
+            block_qhash = meta.get("qhash") or "none"
+            n = meta.get("n")
+            served_qhash = _qhash(current_query) if current_query.strip() else "none"
+            if served_qhash == "none" or block_qhash == "none":
+                stale = "unknown"
+            elif cache_hit and block_qhash != served_qhash:
+                stale = "true"
+            else:
+                stale = "false"
+            _log_prefetch(
+                "astral_prefetch: event=serve sid=%s cache_hit=%s qhash=%s "
+                "served_for_turn_qhash=%s stale=%s block_hash=%s n=%s mode=%s",
+                sid, "true" if cache_hit else "false",
+                block_qhash, served_qhash, stale,
+                _qhash(block), n if n is not None else "none",
+                self._prefetch_mode,
+            )
+        except Exception as e:  # noqa: BLE001
+            _log_prefetch(
+                "astral_prefetch: event=serve sid=%s parse_error=%s",
+                sid, type(e).__name__,
+            )
+
     def _do_prefetch(self, query: str, session_id: str) -> str:
         if not query.strip():
             return ""
+        # v2.11.3 (F1): dup_in_turn — per-sid, per-turn count of computes.
+        # A warm (background) followed by a fallback serve-compute in the
+        # same turn is the legitimate "warm not consumed" shape; a raw
+        # repeat > 1 within one turn is the P1 duplication signal.
+        try:
+            with self._state_lock:
+                turn = self._turn_counts.get(session_id, 0)
+                slot = self._prefetch_compute_counts.get(session_id)
+                if slot is None or slot["turn"] != turn:
+                    slot = {"turn": turn, "count": 0}
+                    self._prefetch_compute_counts[session_id] = slot
+                slot["count"] += 1
+                dup = slot["count"]
+        except Exception:
+            dup = 1
+        t0 = time.monotonic()
         payload: dict[str, Any] = {
             "query": query,
             "max_memories": self._max_recall,
@@ -1921,6 +2393,16 @@ class AstralCoreMemoryProvider(MemoryProvider):
         data = self._http.post("/v1/memory/augmented-prompt", payload)
         if "error" in data:
             logger.debug("Prefetch failed (non-fatal): %s", data["error"])
+            # F1: the compute still happened server-round-trip-wise; log it
+            # with the error so the journal shows why no serve follows.
+            _log_prefetch(
+                "astral_prefetch: event=compute sid=%s qhash=%s qlen=%d "
+                "query_used=%s error=%s elapsed_ms=%d%s",
+                session_id, _qhash(query), len(query),
+                '"' + " ".join(query[:80].split()) + '"',
+                str(data["error"])[:120], int((time.monotonic() - t0) * 1000),
+                f" dup_in_turn={dup}" if dup > 1 else "",
+            )
             return ""
 
         block = str(data.get("context_block", "") or "")
@@ -1936,21 +2418,58 @@ class AstralCoreMemoryProvider(MemoryProvider):
                 f"the following are cross-namespace results]\n" + block
             )
 
+        # v2.12.0: inject floor — drop <memory> elements below the
+        # relevance floor BEFORE ids/texts are recorded, so fidelity and
+        # the delegation manifest only ever see what the LLM saw.
+        floor_note = ""
+        dropped_ids: list[str] = []
+        if self._inject_floor > 0.0 and block:
+            block, kept_ids, dropped_ids, parsed = _apply_inject_floor(
+                block, self._inject_floor)
+            if not parsed:
+                floor_note = " floor=unparsed"
+            else:
+                floor_note = f" floor_dropped={len(dropped_ids)}"
+                _log_prefetch(
+                    "astral_inject_floor: sid=%s floor=%s kept=%d dropped=%d "
+                    "ids=%s",
+                    session_id, self._inject_floor, len(kept_ids),
+                    len(dropped_ids), ",".join(dropped_ids) or "none",
+                )
+                if kept_ids == [] and block.strip() and "<memory" not in block:
+                    # Every element went; what remains is server framing
+                    # with nothing inside it. Inject nothing rather than an
+                    # empty preamble.
+                    block = ""
+
         # Track which memories the server injected (server >= v2.12.x
         # returns `memory_ids`; older servers omit it — treat as empty,
         # never let provenance tracking break recall).
         ids = data.get("memory_ids")
         if isinstance(ids, list):
+            ids = [str(i) for i in ids if i and str(i) not in dropped_ids]
             with self._state_lock:
-                self._recalled_ids[session_id] = [
-                    str(i) for i in ids if i
-                ][:32]
+                self._recalled_ids[session_id] = ids[:32]
         # v2.9.0 (RT-13 F2): if the server also returns per-memory objects
         # (any of memories/results/items with id+text), keep the text for
         # A1. Older servers return ids only → those stay UNSCORED for A1.
+        # Server F11 (2.17.x) returns `memories` as [{id, text}, …].
+        # v2.12.0: the served set is TURN-scoped. A new compute starts the
+        # turn's set; astral_recall adds to it; _fidelity_after_turn
+        # consumes and clears it. Before this, the bucket lived for the
+        # whole session (last 64) and after_turn merged every id in it
+        # into `served`, so once F11 returns prefetch texts A1 would have
+        # scored each reply against memories from earlier turns.
+        with self._state_lock:
+            self._served_texts[session_id] = {}
         for key in ("memories", "results", "items"):
             objs = data.get(key)
             if isinstance(objs, list) and objs:
+                if dropped_ids:
+                    objs = [o for o in objs
+                            if not (isinstance(o, dict)
+                                    and str(o.get("id") or o.get("memory_id") or "")
+                                    in dropped_ids)]
                 self._remember_served(session_id, objs)
                 break
 
@@ -2023,6 +2542,34 @@ class AstralCoreMemoryProvider(MemoryProvider):
         if pref_block:
             block = block + pref_block if block else pref_block.strip()
 
+        # v2.11.3 (F1): event=compute — one line per successful compute.
+        # Everything parsing-derived is guarded; failures degrade to
+        # none/<type> and never raise (§4). The meta memo (qhash/n) lets
+        # the serve line compute `stale` without a cross-turn log join.
+        served_n = len(self._recalled_ids.get(session_id) or [])
+        try:
+            with self._state_lock:
+                self._prefetch_block_meta[session_id] = {
+                    "qhash": _qhash(query), "n": served_n,
+                }
+            _log_prefetch(
+                "astral_prefetch: event=compute sid=%s qhash=%s qlen=%d "
+                "query_used=%s memory_ids=%s n=%d top_relevance=%s "
+                "elapsed_ms=%d%s%s",
+                session_id, _qhash(query), len(query),
+                '"' + " ".join(query[:80].split()) + '"',
+                ",".join(str(i) for i in (ids if isinstance(ids, list) else [])),
+                served_n,
+                _top_relevance(block), int((time.monotonic() - t0) * 1000),
+                f" dup_in_turn={dup}" if dup > 1 else "",
+                floor_note,
+            )
+        except Exception as e:  # noqa: BLE001
+            _log_prefetch(
+                "astral_prefetch: event=compute sid=%s parse_error=%s",
+                session_id, type(e).__name__,
+            )
+
         return block
 
     # ------------------------------------------------------------------
@@ -2093,6 +2640,19 @@ class AstralCoreMemoryProvider(MemoryProvider):
             # on this line — whether guard (D) fires on ordinary turns is
             # only readable from production logs if it is not DEBUG.
             logger.info("sync_turn: skipped distilled-marker turn: %.60s",
+                        combined.strip())
+            return
+
+        # v2.12.0: T0 vacuity pre-filter. Content-free exchanges ("thanks" /
+        # "you're welcome") carry nothing for the dyad extractor and only
+        # feed the surprise gate noise. Strict on purpose: zero user content
+        # tokens AND <3 assistant content tokens — a proper noun or a real
+        # answer always passes (this is NOT the N-10a word-count filter).
+        # Fidelity already observed the turn above.
+        if self._t0_vacuity_filter and _is_vacuous_turn(user_content, assistant_content):
+            with self._state_lock:
+                self._capture_skipped_vacuous += 1
+            logger.info("sync_turn: skipped vacuous turn (T0 pre-filter): %.60s",
                         combined.strip())
             return
 
@@ -2207,6 +2767,8 @@ class AstralCoreMemoryProvider(MemoryProvider):
             if reset:
                 # Genuinely new conversation — drop everything.
                 self._prefetch_cache.clear()
+                self._prefetch_block_meta.clear()
+                self._prefetch_compute_counts.clear()
                 self._turn_counts.clear()
                 self._recalled_ids.clear()
             else:
@@ -2214,6 +2776,10 @@ class AstralCoreMemoryProvider(MemoryProvider):
                 # recalled context across an id boundary.
                 self._prefetch_cache.pop(old, None)
                 self._prefetch_cache.pop(new_session_id, None)
+                self._prefetch_block_meta.pop(old, None)
+                self._prefetch_block_meta.pop(new_session_id, None)
+                self._prefetch_compute_counts.pop(old, None)
+                self._prefetch_compute_counts.pop(new_session_id, None)
                 self._recalled_ids.pop(old, None)
                 self._recalled_ids.pop(new_session_id, None)
                 if old and old in self._turn_counts:
@@ -2221,6 +2787,7 @@ class AstralCoreMemoryProvider(MemoryProvider):
 
             if rewound:
                 self._prefetch_cache.pop(new_session_id, None)
+                self._prefetch_block_meta.pop(new_session_id, None)
 
         logger.debug(
             "Session switch %s -> %s (reset=%s rewound=%s parent=%s)",
@@ -2544,6 +3111,36 @@ class AstralCoreMemoryProvider(MemoryProvider):
                 "default": "300",
             },
             {
+                "key": "prefetch_mode",
+                "description": (
+                    "'live': recall is computed for the message being "
+                    "answered (2.12.0 fix). 'warm': the 2.11.x one-turn-"
+                    "behind cache (rollback only)."
+                ),
+                "default": "live",
+                "choices": ["live", "warm"],
+            },
+            {
+                "key": "inject_floor",
+                "description": (
+                    "Minimum relevance (0-1) for an auto-recalled memory to be "
+                    "injected; memories below it are removed from the block. "
+                    "0 disables. Observe top_relevance in the logs before "
+                    "setting this."
+                ),
+                "default": "0",
+            },
+            {
+                "key": "t0_vacuity_filter",
+                "description": (
+                    "Skip auto-capture of content-free exchanges (bare "
+                    "acknowledgements). Any proper noun or real answer still "
+                    "captures."
+                ),
+                "default": "true",
+                "choices": ["true", "false"],
+            },
+            {
                 "key": "briefing_on_start",
                 "description": "Prepend the briefing card on the first turn of a session",
                 "default": "false",
@@ -2566,7 +3163,8 @@ class AstralCoreMemoryProvider(MemoryProvider):
         existing = _read_config(hermes_home)
 
         coerced = dict(values)
-        for key in ("auto_capture", "auto_recall", "briefing_on_start"):
+        for key in ("auto_capture", "auto_recall", "briefing_on_start",
+                    "t0_vacuity_filter"):
             if key in coerced and isinstance(coerced[key], str):
                 coerced[key] = coerced[key].strip().lower() in ("true", "1", "yes")
 
@@ -2575,6 +3173,17 @@ class AstralCoreMemoryProvider(MemoryProvider):
                 coerced["max_recall_memories"] = int(coerced["max_recall_memories"])
             except (TypeError, ValueError):
                 coerced["max_recall_memories"] = 8
+
+        # v2.12.0
+        if "prefetch_mode" in coerced:
+            pm = str(coerced["prefetch_mode"] or "").strip().lower()
+            coerced["prefetch_mode"] = pm if pm in ("live", "warm") else "live"
+        if "inject_floor" in coerced:
+            try:
+                fl = float(coerced["inject_floor"] or 0.0)
+            except (TypeError, ValueError):
+                fl = 0.0
+            coerced["inject_floor"] = fl if 0.0 <= fl <= 1.0 else 0.0
 
         if "default_namespace" in coerced:
             ns = str(coerced["default_namespace"] or "").strip()
